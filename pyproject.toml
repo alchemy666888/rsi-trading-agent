@@ -1,0 +1,15 @@
+[project]
+name = "btc-self-improve-agent"
+version = "0.1.0"
+description = "Self-improving BTC strategy simulation agent"
+requires-python = ">=3.12"
+dependencies = [
+  "openai>=1.0.0",
+  "ccxt>=4.0.0",
+  "pandas>=2.0.0",
+  "numpy>=1.26.0",
+  "duckduckgo-search>=6.0.0"
+]
+
+[tool.setuptools]
+packages = ["btc_self_improve_agent"]
