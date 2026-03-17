@@ -1,0 +1,5 @@
+openai>=1.0.0
+ccxt>=4.0.0
+pandas>=2.0.0
+numpy>=1.26.0
+duckduckgo-search>=6.0.0
