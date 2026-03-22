@@ -246,13 +246,15 @@ def self_reflect_trade(client, result):
 ```
 
 #### 4.4 Long-term Memory（memory.py）—— Context Engineering
+
 ```python
 import sqlite3
 import json
 
+
 class MemoryManager:
     def __init__(self, session_id):
-        self.conn = sqlite3.connect('strategies.db')
+        self.conn = sqlite3.connect('../strategies.db')
         self.cursor = self.conn.cursor()
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS strategies
                               (id INTEGER PRIMARY KEY, session_id TEXT, strategy TEXT, metrics TEXT, score INT, lesson TEXT)''')
@@ -261,13 +263,15 @@ class MemoryManager:
     def store_strategy(self, strategy, metrics, score, lesson):
         strategy_json = json.dumps(strategy)
         metrics_json = json.dumps(metrics)
-        self.cursor.execute("INSERT INTO strategies (session_id, strategy, metrics, score, lesson) VALUES (?, ?, ?, ?, ?)",
-                            (self.session_id, strategy_json, metrics_json, score, lesson))
+        self.cursor.execute(
+            "INSERT INTO strategies (session_id, strategy, metrics, score, lesson) VALUES (?, ?, ?, ?, ?)",
+            (self.session_id, strategy_json, metrics_json, score, lesson))
         self.conn.commit()
 
     def get_relevant_lessons(self, goal):
-        self.cursor.execute("SELECT lesson FROM strategies WHERE session_id = ? AND score > 70 ORDER BY score DESC LIMIT 3",
-                            (self.session_id,))
+        self.cursor.execute(
+            "SELECT lesson FROM strategies WHERE session_id = ? AND score > 70 ORDER BY score DESC LIMIT 3",
+            (self.session_id,))
         lessons = [row[0] for row in self.cursor.fetchall()]
         return "\n".join(lessons) if lessons else "No past lessons yet."
 ```

@@ -5,7 +5,7 @@ This project runs a self-improving BTC strategy simulation loop that combines te
 ## Prerequisites
 
 - Python 3.12+
-- A DeepSeek API key
+- An Anthropic API key (Claude)
 
 ## Setup
 
@@ -22,10 +22,14 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-3. Set your API key:
+3. Create a `.env` file in the project root:
 
 ```bash
-export DEEPSEEK_API_KEY="your_api_key_here"
+cat > .env << 'EOF'
+ANTHROPIC_API_KEY=your_api_key_here
+# Optional: override default model
+CLAUDE_MODEL=claude-3-5-sonnet-20240620
+EOF
 ```
 
 ## Run the project

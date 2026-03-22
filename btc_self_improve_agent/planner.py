@@ -72,28 +72,66 @@ def _sanitize_strategy(raw: dict[str, Any]) -> dict[str, float]:
     return out
 
 
-def create_strategy_plan(client: Any, user_goal: str, context: str, system_prompt: str = "") -> dict[str, float]:
+def _extract_text_content(response: Any) -> str:
+    parts: list[str] = []
+    for block in getattr(response, "content", []):
+        if getattr(block, "type", None) == "text":
+            parts.append(str(getattr(block, "text", "")))
+    return "\n".join(part for part in parts if part)
+
+
+def create_strategy_plan(
+    client: Any,
+    user_goal: str,
+    context: str,
+    system_prompt: str = "",
+    model: str = "claude-3-5-sonnet-20240620",
+) -> dict[str, float]:
     prompt = f"""
 User goal: {user_goal}
 Past lessons: {context}
 
 Return only JSON for BTC daily strategy parameters.
 Example: {{"rsi_buy": 30, "rsi_sell": 70, "ma_short": 10, "ma_long": 50, "news_weight": 0.5}}
+Do not include markdown fences or any commentary.
 """
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
 
-    try:
-        response = client.chat.completions.create(
-            model="deepseek-chat",
-            messages=messages,
-            response_format={"type": "json_object"},
-        )
-        content = response.choices[0].message.content or "{}"
-        raw = _extract_json_object(content)
-    except Exception:
+    candidate_models: list[str] = []
+    for m in [
+        model,
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-sonnet-20240620",
+        "claude-3-sonnet-20240229",
+        "claude-3-opus-20240229",
+        "claude-3-haiku-20240307",
+    ]:
+        if m and m not in candidate_models:
+            candidate_models.append(m)
+
+    raw: dict[str, Any] = {}
+    last_exc: Exception | None = None
+
+    for candidate in candidate_models:
+        try:
+            payload: dict[str, Any] = {
+                "model": candidate,
+                "max_tokens": 512,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if system_prompt:
+                payload["system"] = system_prompt
+
+            response = client.messages.create(**payload)
+            content = _extract_text_content(response) or "{}"
+            raw = _extract_json_object(content)
+            if raw:
+                break
+        except Exception as exc:  # pragma: no cover - network/LLM failures
+            last_exc = exc
+            continue
+
+    if not raw:
+        print(f"[planner] Using default strategy because LLM call failed: {last_exc}", flush=True)
         raw = {}
 
     return _sanitize_strategy(raw)

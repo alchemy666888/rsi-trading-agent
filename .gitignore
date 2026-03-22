@@ -5,3 +5,6 @@ __pycache__/
 .pytest_cache/
 strategies.db
 traces/
+.env
+.env.*
+!.env.example
