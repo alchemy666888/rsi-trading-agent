@@ -43,7 +43,7 @@ class ToolsTest(unittest.TestCase):
             self.assertFalse(self.frames[tf].empty)
 
     def test_weekly_backtest_and_score(self):
-        strategy = {"rsi_buy": 35, "rsi_sell": 65, "weight_resonance": 1.1}
+        strategy = {"entry_timeframe": "1h", "rsi_buy": 35, "rsi_sell": 65, "weight_resonance": 1.1}
         result = run_weekly_backtest(self.frames, strategy)
         metrics = result["metrics"]
         for key in ["total_return", "sharpe", "max_dd", "win_rate", "profit_factor", "costs"]:
@@ -51,6 +51,15 @@ class ToolsTest(unittest.TestCase):
 
         score = compute_weekly_score(metrics)
         self.assertIsInstance(score, float)
+
+    def test_multi_timeframe_backtest_simulation_accepts_resampled_frames(self):
+        strategy = {"entry_timeframe": "auto", "rsi_buy": 35, "rsi_sell": 65, "news_weight": 0.4}
+        result = run_backtest_simulation(self.frames, news=[{"sentiment": 0.2}], strategy=strategy)
+
+        for key in ["total_return", "sharpe", "max_dd", "win_rate", "profit_factor", "trade_count", "entry_timeframe", "execution_timeframe"]:
+            self.assertIn(key, result)
+        self.assertEqual(result["entry_timeframe"], "auto")
+        self.assertEqual(result["execution_timeframe"], "15m")
 
     def test_persist_trace_creates_file(self):
         metrics = {"total_return": 1.0, "sharpe": 0.5, "max_dd": 5.0, "win_rate": 55.0, "costs": 0.1}

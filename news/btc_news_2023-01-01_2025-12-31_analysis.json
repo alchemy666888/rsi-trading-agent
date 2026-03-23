@@ -1,0 +1,21 @@
+{
+  "summary": "Unable to analyze BTC news narratives due to empty sample articles array. The dataset contains 116 articles spanning from 2023 to 2025, but none have associated dates and no content samples were provided for analysis.",
+  "narratives": [
+    "Data unavailable - no article content provided",
+    "Timeline unclear - zero dated articles",
+    "Analysis incomplete - missing sample data"
+  ],
+  "sentiment_assessment": "Cannot assess market sentiment without access to article content. The presence of 116 articles suggests active coverage of Bitcoin-related topics, but the lack of dated articles and sample content prevents any meaningful sentiment analysis or trend identification.",
+  "trading_implications": [
+    "No actionable insights available due to missing article content",
+    "Risk of incomplete market picture without proper data analysis",
+    "Need for data quality improvement before trading decisions"
+  ],
+  "coverage_notes": "Archive appears incomplete with significant data quality issues - 116 articles collected but zero properly dated, and no sample content provided for analysis",
+  "metrics": {
+    "start_date": "2023-01-01",
+    "end_date": "2025-12-31",
+    "article_count": 116,
+    "dated_article_count": 0
+  }
+}

@@ -38,7 +38,11 @@ class BTCSelfImprovingAgent:
         self.client = Anthropic(api_key=key)
         self.model = _resolve_model(model)
         self.memory = MemoryManager(session_id=session_id)
-        self.system_prompt = "You are a BTC trading strategy optimizer. Use past lessons to improve."
+        self.system_prompt = (
+            "You are a BTC trading strategy optimizer. Use past lessons to improve. "
+            "Prefer multi-timeframe strategies that use 15m or 1h for entries, with 4h and 1d used as the trend "
+            "and confirmation layer. Treat news as a regime filter rather than a standalone trigger."
+        )
 
     def _update_system_prompt(self, lesson: str) -> None:
         self.system_prompt += f"\nNew lesson: {lesson}"
@@ -52,11 +56,11 @@ class BTCSelfImprovingAgent:
                 context = self.memory.get_relevant_lessons()
                 strategy = create_strategy_plan(self.client, user_goal, context, self.system_prompt, model=self.model)
 
-                data = execute_tool({"name": "fetch_btc_data", "args": {"period": "2y"}}, require_confirmation=False)
-                indicators = execute_tool(
-                    {"name": "calculate_indicators", "args": {"data": data, "params": strategy}},
+                data = execute_tool(
+                    {"name": "fetch_btc_data", "args": {"timeframe": "15m", "period": "2y"}},
                     require_confirmation=False,
                 )
+                indicators = execute_tool({"name": "resample_features", "args": {"raw": data}}, require_confirmation=False)
                 news_sentiment = execute_tool({"name": "fetch_btc_news", "args": {}}, require_confirmation=False)
                 backtest_result = execute_tool(
                     {

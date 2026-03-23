@@ -5,7 +5,7 @@ import re
 from typing import Any
 
 
-DEFAULT_STRATEGY: dict[str, float] = {
+DEFAULT_STRATEGY: dict[str, Any] = {
     "rsi_buy": 30,
     "rsi_sell": 70,
     "ma_short": 10,
@@ -17,6 +17,9 @@ DEFAULT_STRATEGY: dict[str, float] = {
     "bb_period": 20,
     "bb_std": 2,
     "news_weight": 0.3,
+    "weight_resonance": 1.1,
+    "conflict_penalty": 0.4,
+    "max_position": 1.0,
 }
 
 
@@ -41,8 +44,11 @@ def _extract_json_object(text: str) -> dict[str, Any]:
             return {}
 
 
-def _sanitize_strategy(raw: dict[str, Any]) -> dict[str, float]:
+def _sanitize_strategy(raw: dict[str, Any]) -> dict[str, Any]:
     out = DEFAULT_STRATEGY.copy()
+
+    entry_timeframe = str(raw.get("entry_timeframe", "auto")).lower()
+    out["entry_timeframe"] = entry_timeframe if entry_timeframe in {"15m", "1h", "auto"} else "auto"
 
     def _num(name: str, lo: float, hi: float) -> None:
         if name in raw:
@@ -63,6 +69,9 @@ def _sanitize_strategy(raw: dict[str, Any]) -> dict[str, float]:
     _num("bb_period", 5, 100)
     _num("bb_std", 1, 4)
     _num("news_weight", 0, 2)
+    _num("weight_resonance", 0.5, 2)
+    _num("conflict_penalty", 0, 1)
+    _num("max_position", 0.1, 3)
 
     if out["ma_short"] >= out["ma_long"]:
         out["ma_short"] = min(out["ma_long"] - 1, out["ma_short"])
@@ -86,13 +95,15 @@ def create_strategy_plan(
     context: str,
     system_prompt: str = "",
     model: str = "claude-3-5-sonnet-20240620",
-) -> dict[str, float]:
+) -> dict[str, Any]:
     prompt = f"""
 User goal: {user_goal}
 Past lessons: {context}
 
-Return only JSON for BTC daily strategy parameters.
-Example: {{"rsi_buy": 30, "rsi_sell": 70, "ma_short": 10, "ma_long": 50, "news_weight": 0.5}}
+Return only JSON for BTC multi-timeframe strategy parameters.
+Use 15m or 1h as the entry timeframe and use 4h and 1d as the higher-timeframe trend and signal filter.
+Treat news sentiment as a regime filter, not a standalone trigger.
+Example: {{"entry_timeframe": "auto", "rsi_buy": 30, "rsi_sell": 70, "weight_resonance": 1.1, "conflict_penalty": 0.4, "news_weight": 0.5}}
 Do not include markdown fences or any commentary.
 """
 

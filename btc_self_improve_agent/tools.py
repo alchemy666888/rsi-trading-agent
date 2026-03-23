@@ -184,9 +184,10 @@ def resample_features(raw: Iterable[dict[str, Any]] | pd.DataFrame, timeframes: 
 
     ohlc = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
     frames: dict[str, pd.DataFrame] = {}
+    pandas_freq = {"1m": "1min", "5m": "5min", "15m": "15min", "1h": "1h", "4h": "4h", "1d": "1D"}
 
     for tf in timeframes:
-        resampled = df.resample(tf).agg(ohlc).dropna(how="any")
+        resampled = df.resample(pandas_freq.get(tf, tf)).agg(ohlc).dropna(how="any")
         frames[tf] = _add_indicators(resampled)
 
     return frames
@@ -198,95 +199,9 @@ def run_weekly_backtest(
     costs: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Run a weekly backtest on 15m bars using multi-timeframe resonance and configurable costs."""
-
-    costs = {**DEFAULT_COSTS, **(costs or {})}
-    df_15 = frames_by_tf.get("15m")
-    if df_15 is None:
-        raise ValueError("frames_by_tf must include 15m timeframe for execution")
-
-    tf_align = {}
-    for tf in ["1h", "4h", "1d"]:
-        frame = frames_by_tf.get(tf)
-        if frame is None:
-            raise ValueError(f"frames_by_tf missing timeframe: {tf}")
-        tf_align[tf] = frame.reindex(df_15.index, method="ffill")
-
-    base = df_15.copy()
-
-    # Directional signals
-    base["trend_1d"] = np.where(tf_align["1d"]["EMA_short"] > tf_align["1d"]["EMA_long"], 1, -1)
-    macd_1h = tf_align["1h"]["MACD"]
-    macd_4h = tf_align["4h"]["MACD"]
-    rsi_15 = base["RSI"]
-
-    long_ok = (rsi_15 < strategy_params.get("rsi_buy", 30)) & (macd_1h > 0) & (base["trend_1d"] > 0)
-    short_ok = (rsi_15 > strategy_params.get("rsi_sell", 70)) & (macd_1h < 0) & (base["trend_1d"] < 0)
-
-    base["signal"] = 0.0
-    base.loc[long_ok, "signal"] = 1.0
-    base.loc[short_ok, "signal"] = -1.0
-
-    # Resonance weighting: require 4h to agree; otherwise dampen exposure.
-    resonance_weight = float(strategy_params.get("weight_resonance", 1.2))
-    conflict_penalty = float(strategy_params.get("conflict_penalty", 0.5))
-    agree = np.sign(macd_4h.fillna(0)) == np.sign(base["trend_1d"])
-    base.loc[agree, "signal"] *= resonance_weight
-    base.loc[~agree, "signal"] *= conflict_penalty
-
-    # Position sizing with per-trade risk cap using 15m ATR percentage.
-    atr_pct = _atr_percentage(base)
-    max_loss = float(costs.get("max_loss_per_trade", 0.005))
-    max_pos = float(strategy_params.get("max_position", 1.0))
-
-    position = []
-    prev_pos = 0.0
-    trade_costs: list[float] = []
-    returns: list[float] = []
-
-    pct_change = base["Close"].pct_change().fillna(0).to_numpy()
-    signals = base["signal"].fillna(0).to_numpy()
-    atr_values = atr_pct.to_numpy()
-
-    for i, sig in enumerate(signals):
-        allowed_pos = sig
-        if atr_values[i] > 0:
-            cap = max_loss / atr_values[i]
-            allowed_pos = float(np.clip(allowed_pos, -cap, cap))
-        allowed_pos = float(np.clip(allowed_pos, -max_pos, max_pos))
-
-        turnover = abs(allowed_pos - prev_pos)
-        trade_cost = turnover * (costs["fee_rate"] + costs["slippage_rate"])
-
-        ret = pct_change[i] * prev_pos - trade_cost
-
-        position.append(allowed_pos)
-        trade_costs.append(trade_cost)
-        returns.append(ret)
-        prev_pos = allowed_pos
-
-    returns_series = pd.Series(returns, index=base.index, dtype=float)
-    cum_returns = (1 + returns_series).cumprod()
-    rolling_peak = cum_returns.cummax().replace(0, np.nan)
-    drawdown = ((rolling_peak - cum_returns) / rolling_peak).fillna(0)
-
-    neg_sum = returns_series[returns_series < 0].sum()
-    profit_factor = float(abs(returns_series[returns_series > 0].sum() / neg_sum)) if neg_sum != 0 else float("inf")
-
-    ann_factor = np.sqrt(365 * 24 * 4)  # 15m bars per year
-    volatility = returns_series.std()
-    sharpe = float((returns_series.mean() / volatility) * ann_factor) if volatility != 0 else 0.0
-
-    metrics = {
-        "total_return": float((returns_series.sum()) * 100),
-        "sharpe": sharpe,
-        "max_dd": float(drawdown.max() * 100) if len(drawdown) else 0.0,
-        "win_rate": float((returns_series > 0).mean() * 100),
-        "profit_factor": profit_factor,
-        "costs": float(sum(trade_costs) * 100),
-        "trade_count": int(np.count_nonzero(np.diff([0, *position]))) if position else 0,
-    }
-
-    return {"metrics": metrics, "positions": position, "returns": returns_series.tolist()}
+    result = _run_multi_timeframe_backtest(frames_by_tf=frames_by_tf, strategy=strategy_params, costs=costs)
+    metrics = {key: result[key] for key in ["total_return", "sharpe", "max_dd", "win_rate", "profit_factor", "costs", "trade_count"]}
+    return {"metrics": metrics, "positions": result["positions"], "returns": result["returns"]}
 
 
 def compute_weekly_score(
@@ -470,6 +385,10 @@ def run_backtest_simulation(
     """Minimal V1-style backtest kept to avoid breaking older entrypoints."""
 
     strategy = strategy or {"rsi_buy": 30, "rsi_sell": 70, "news_weight": 0.2}
+
+    if {"15m", "1h", "4h", "1d"}.issubset(set(indicators.keys())):
+        return _run_multi_timeframe_backtest(frames_by_tf=indicators, strategy=strategy, news=news)
+
     df = pd.DataFrame(indicators).copy()
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
@@ -509,6 +428,157 @@ def run_backtest_simulation(
         "trade_count": len(trades),
         "trades": trades,
     }
+
+
+def _run_multi_timeframe_backtest(
+    *,
+    frames_by_tf: dict[str, Any],
+    strategy: dict[str, Any],
+    news: list[dict[str, Any]] | None = None,
+    costs: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    costs = {**DEFAULT_COSTS, **(costs or {})}
+    prepared_frames = {tf: _coerce_frame(frame) for tf, frame in frames_by_tf.items()}
+
+    entry_timeframe = str(strategy.get("entry_timeframe", "auto")).lower()
+    if entry_timeframe not in {"15m", "1h", "auto"}:
+        entry_timeframe = "auto"
+
+    base_tf = "15m" if entry_timeframe == "auto" else entry_timeframe
+    base = prepared_frames.get(base_tf)
+    if base is None or base.empty:
+        raise ValueError(f"frames_by_tf must include {base_tf} timeframe for execution")
+
+    aligned: dict[str, pd.DataFrame] = {}
+    for tf in ["15m", "1h", "4h", "1d"]:
+        frame = prepared_frames.get(tf)
+        if frame is None or frame.empty:
+            raise ValueError(f"frames_by_tf missing timeframe: {tf}")
+        aligned[tf] = frame.reindex(base.index, method="ffill")
+
+    avg_sentiment = float(np.mean([n.get("sentiment", 0.0) for n in news])) if news else 0.0
+    resonance_weight = float(strategy.get("weight_resonance", 1.1))
+    conflict_penalty = float(strategy.get("conflict_penalty", 0.4))
+    news_weight = float(strategy.get("news_weight", 0.3))
+    max_loss = float(costs.get("max_loss_per_trade", 0.005))
+    max_pos = float(strategy.get("max_position", 1.0))
+
+    trend_4h = np.where(aligned["4h"]["EMA_short"] >= aligned["4h"]["EMA_long"], 1.0, -1.0)
+    trend_1d = np.where(aligned["1d"]["EMA_short"] >= aligned["1d"]["EMA_long"], 1.0, -1.0)
+    confirm_4h_long = aligned["4h"]["MACD"] >= aligned["4h"]["MACD_signal"]
+    confirm_4h_short = aligned["4h"]["MACD"] <= aligned["4h"]["MACD_signal"]
+    higher_tf_agree = trend_4h == trend_1d
+    higher_tf_long = (trend_4h > 0) & (trend_1d > 0) & confirm_4h_long
+    higher_tf_short = (trend_4h < 0) & (trend_1d < 0) & confirm_4h_short
+
+    setup_15_long = (aligned["15m"]["RSI"] <= strategy.get("rsi_buy", 30)) & (
+        aligned["15m"]["MACD"] >= aligned["15m"]["MACD_signal"]
+    )
+    setup_15_short = (aligned["15m"]["RSI"] >= strategy.get("rsi_sell", 70)) & (
+        aligned["15m"]["MACD"] <= aligned["15m"]["MACD_signal"]
+    )
+    setup_1h_long = (aligned["1h"]["RSI"] <= strategy.get("rsi_buy", 30)) & (
+        aligned["1h"]["MACD"] >= aligned["1h"]["MACD_signal"]
+    )
+    setup_1h_short = (aligned["1h"]["RSI"] >= strategy.get("rsi_sell", 70)) & (
+        aligned["1h"]["MACD"] <= aligned["1h"]["MACD_signal"]
+    )
+
+    if entry_timeframe == "15m":
+        long_setup = setup_15_long
+        short_setup = setup_15_short
+        entry_tf = np.where(long_setup | short_setup, "15m", "")
+    elif entry_timeframe == "1h":
+        long_setup = setup_1h_long
+        short_setup = setup_1h_short
+        entry_tf = np.where(long_setup | short_setup, "1h", "")
+    else:
+        long_setup = setup_15_long | setup_1h_long
+        short_setup = setup_15_short | setup_1h_short
+        entry_tf = np.where(setup_1h_long | setup_1h_short, "1h", np.where(setup_15_long | setup_15_short, "15m", ""))
+
+    base = base.copy()
+    base["trend_4h"] = trend_4h
+    base["trend_1d"] = trend_1d
+    base["entry_signal_tf"] = entry_tf
+    base["higher_tf_aligned"] = higher_tf_agree.astype(float)
+    base["signal"] = 0.0
+    base.loc[long_setup & higher_tf_long, "signal"] = 1.0
+    base.loc[short_setup & higher_tf_short, "signal"] = -1.0
+    base.loc[higher_tf_agree, "signal"] *= resonance_weight
+    base.loc[~higher_tf_agree, "signal"] *= conflict_penalty
+
+    sentiment_bias = np.sign(avg_sentiment)
+    long_regime = 1.0 + max(avg_sentiment, 0.0) * news_weight if sentiment_bias >= 0 else max(0.0, 1.0 + avg_sentiment * news_weight)
+    short_regime = 1.0 + abs(min(avg_sentiment, 0.0)) * news_weight if sentiment_bias <= 0 else max(0.0, 1.0 - avg_sentiment * news_weight)
+    base.loc[base["signal"] > 0, "signal"] *= long_regime
+    base.loc[base["signal"] < 0, "signal"] *= short_regime
+    base["news_regime_multiplier"] = np.where(base["signal"] > 0, long_regime, np.where(base["signal"] < 0, short_regime, 1.0))
+
+    atr_pct = _atr_percentage(base)
+    position: list[float] = []
+    trade_costs: list[float] = []
+    returns: list[float] = []
+    prev_pos = 0.0
+
+    pct_change = base["Close"].pct_change().fillna(0).to_numpy()
+    signals = base["signal"].fillna(0).to_numpy()
+    atr_values = atr_pct.to_numpy()
+
+    for i, sig in enumerate(signals):
+        allowed_pos = float(sig)
+        if atr_values[i] > 0:
+            cap = max_loss / atr_values[i]
+            allowed_pos = float(np.clip(allowed_pos, -cap, cap))
+        allowed_pos = float(np.clip(allowed_pos, -max_pos, max_pos))
+
+        turnover = abs(allowed_pos - prev_pos)
+        trade_cost = turnover * (costs["fee_rate"] + costs["slippage_rate"])
+        ret = pct_change[i] * prev_pos - trade_cost
+
+        position.append(allowed_pos)
+        trade_costs.append(trade_cost)
+        returns.append(ret)
+        prev_pos = allowed_pos
+
+    base["timestamp"] = base.index
+    position_series = pd.Series(position, index=base.index, dtype=float)
+    returns_series = pd.Series(returns, index=base.index, dtype=float)
+    cum_returns = (1 + returns_series).cumprod()
+    rolling_peak = cum_returns.cummax().replace(0, np.nan)
+    drawdown = ((rolling_peak - cum_returns) / rolling_peak).fillna(0)
+    neg_sum = returns_series[returns_series < 0].sum()
+    profit_factor = float(abs(returns_series[returns_series > 0].sum() / neg_sum)) if neg_sum != 0 else float("inf")
+    volatility = returns_series.std()
+    bars_per_year = {"15m": 365 * 24 * 4, "1h": 365 * 24}.get(base_tf, 365 * 24 * 4)
+    sharpe = float((returns_series.mean() / volatility) * np.sqrt(bars_per_year)) if volatility != 0 else 0.0
+    trades = _extract_trade_details(base, position_series, pd.to_numeric(base["Close"], errors="coerce"), returns_series, strategy, avg_sentiment)
+
+    return {
+        "total_return": float(returns_series.sum() * 100),
+        "sharpe": sharpe,
+        "max_dd": float(drawdown.max() * 100) if len(drawdown) else 0.0,
+        "win_rate": float((returns_series > 0).mean() * 100),
+        "profit_factor": profit_factor,
+        "costs": float(sum(trade_costs) * 100),
+        "trade_count": len(trades),
+        "trades": trades,
+        "positions": position,
+        "returns": returns_series.tolist(),
+        "entry_timeframe": entry_timeframe,
+        "execution_timeframe": base_tf,
+        "news_sentiment": avg_sentiment,
+    }
+
+
+def _coerce_frame(frame: Any) -> pd.DataFrame:
+    df = pd.DataFrame(frame).copy()
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df.set_index("timestamp", inplace=True)
+    elif not isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
+    return df.sort_index()
 
 
 def _tf_millis(timeframe: str) -> int:
@@ -631,14 +701,25 @@ def _build_entry_rationale(row: pd.Series, position_size: float, strategy: dict[
     macd = _format_decimal(row.get("MACD"))
     macd_signal = _format_decimal(row.get("MACD_signal"))
     news_weight = _format_decimal(strategy.get("news_weight", 0.2))
+    entry_tf = row.get("entry_signal_tf", "")
+    trend_4h = row.get("trend_4h")
+    trend_1d = row.get("trend_1d")
+    regime_multiplier = _format_decimal(row.get("news_regime_multiplier", 1.0))
     if position_size > 0:
         trigger = f"RSI {rsi} below buy threshold {strategy.get('rsi_buy', 30)} with MACD {macd} above signal {macd_signal}"
     else:
         trigger = f"RSI {rsi} above sell threshold {strategy.get('rsi_sell', 70)} with MACD {macd} below signal {macd_signal}"
+    if entry_tf:
+        trigger = f"{entry_tf} entry trigger fired when {trigger}"
+    if trend_4h in (1, 1.0, -1, -1.0) and trend_1d in (1, 1.0, -1, -1.0):
+        trend_text = f" Higher-timeframe trend was {'bullish' if float(trend_4h) > 0 else 'bearish'} on 4h and {'bullish' if float(trend_1d) > 0 else 'bearish'} on 1d."
+    else:
+        trend_text = ""
     return (
         f"Opened {side} exposure when {trigger}. "
-        f"Average news sentiment was {_format_decimal(avg_sentiment)}, scaled by news weight {news_weight}, "
-        f"resulting in position size {_format_decimal(abs(position_size))}."
+        f"Average news sentiment was {_format_decimal(avg_sentiment)}, scaled by news weight {news_weight} "
+        f"for a regime multiplier of {regime_multiplier}, resulting in position size {_format_decimal(abs(position_size))}."
+        f"{trend_text}"
     )
 
 
