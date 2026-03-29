@@ -1,13 +1,18 @@
 # RSI Trading Agent (BTC Self-Improving Agent)
 
-This project runs a self-improving BTC strategy simulation loop that combines technical indicators and news sentiment, then reflects on performance to improve across epochs.
+This project runs a recurring self-improving BTC paper-trading pipeline aligned to:
 
-It now also includes:
+- `docs/developing-rsi-trading-ai-agents.md`
+- `docs/vibe-coding-development-plan-v3.md`
 
-- A market data fetch + analysis agent that saves BTC/USDT historical data and LLM analysis into `data/`
-- A news fetch + analysis agent that saves BTC-related news archives and LLM analysis into `news/`
+The runtime now follows a monthly walk-forward loop from `2023-01-01` to `2025-12-31`:
 
-Both research agents cover `2023-01-01` through `2025-12-31` by default.
+1. fetch Binance BTCUSDT historical OHLCV for `15m`, `1h`, `4h`, and `1d`
+2. pre-calculate indicators and multi-timeframe features
+3. ingest and enrich BTC/crypto/web3 historical news with sentiment and impact windows
+4. paper trade each month using `4h/1d` trend context with `15m/1h` entries/exits
+5. reflect, learn lessons, and update strategy for the next month
+6. generate a final strategy markdown and a final frozen backtest report
 
 ## Prerequisites
 
@@ -47,19 +52,20 @@ Run the main entrypoint:
 python -m btc_self_improve_agent.main
 ```
 
-The script will execute multiple strategy-improvement epochs and print the best result at the end.
+The script performs research and monthly self-improvement, then writes artifacts including:
 
-Before the strategy loop starts, it will also create:
-
+- `data/btc_usdt_15m_2023-01-01_2025-12-31.csv`
+- `data/btc_usdt_1h_2023-01-01_2025-12-31.csv`
+- `data/btc_usdt_4h_2023-01-01_2025-12-31.csv`
 - `data/btc_usdt_1d_2023-01-01_2025-12-31.csv`
-- `data/btc_usdt_1d_2023-01-01_2025-12-31_analysis.json`
-- `data/btc_usdt_1d_2023-01-01_2025-12-31_analysis.md`
+- `data/btc_usdt_15m_2023-01-01_2025-12-31_analysis.md`
 - `news/btc_news_2023-01-01_2025-12-31.json`
-- `news/btc_news_2023-01-01_2025-12-31_analysis.json`
 - `news/btc_news_2023-01-01_2025-12-31_analysis.md`
+- `backtest/monthly_YYYY-MM.md` (for each processed month)
+- `docs/final-btc-strategy.md`
+- `backtest/final_strategy_backtest_report.md`
+- `traces/run_manifest_*.json`
 
 ## Run tests
 
-```bash
-pytest
-```
+`pytest` is supported when dependencies are installed.

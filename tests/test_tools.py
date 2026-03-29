@@ -3,7 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import pandas as pd
+try:
+    import pandas as pd
+except ModuleNotFoundError:  # optional runtime deps not installed in CI container
+    pd = None  # type: ignore[assignment]
 
 try:
     from btc_self_improve_agent.tools import (
@@ -17,7 +20,7 @@ try:
 except ModuleNotFoundError:  # optional runtime deps not installed in CI container
     _TOOLS_AVAILABLE = False
 else:
-    _TOOLS_AVAILABLE = True
+    _TOOLS_AVAILABLE = pd is not None
 
 
 @unittest.skipUnless(_TOOLS_AVAILABLE, "tool runtime dependencies are not installed")
@@ -70,7 +73,11 @@ class ToolsTest(unittest.TestCase):
     def test_backtest_report_contains_trade_details(self):
         indicators = {
             "timestamp": pd.date_range("2024-01-01", periods=5, freq="D", tz="UTC"),
+            "Open": [99.5, 101.5, 103.5, 103.2, 101.8],
+            "High": [100.5, 102.5, 104.5, 103.8, 102.3],
+            "Low": [99.0, 101.0, 103.0, 102.5, 100.8],
             "Close": [100.0, 102.0, 104.0, 103.0, 101.0],
+            "Volume": [1000, 1200, 1400, 1100, 1050],
             "RSI": [40.0, 25.0, 45.0, 75.0, 50.0],
             "MACD": [0.1, 1.2, 0.6, -1.0, -0.2],
             "MACD_signal": [0.2, 0.8, 0.7, -0.5, -0.1],

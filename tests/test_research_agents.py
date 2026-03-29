@@ -4,10 +4,18 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import pandas as pd
+try:
+    import pandas as pd
+except ModuleNotFoundError:  # optional runtime deps not installed in CI container
+    pd = None  # type: ignore[assignment]
 
-from btc_self_improve_agent import research_agents
-from btc_self_improve_agent.research_agents import DataFetchAnalysisAgent, NewsFetchAnalysisAgent
+try:
+    from btc_self_improve_agent import research_agents
+    from btc_self_improve_agent.research_agents import DataFetchAnalysisAgent, NewsFetchAnalysisAgent
+except ModuleNotFoundError:  # optional runtime deps not installed in CI container
+    research_agents = None  # type: ignore[assignment]
+    DataFetchAnalysisAgent = None  # type: ignore[assignment]
+    NewsFetchAnalysisAgent = None  # type: ignore[assignment]
 
 
 class _FakeResponseText:
@@ -34,6 +42,7 @@ class _FakeClient:
         self.messages = _FakeMessages(text)
 
 
+@unittest.skipUnless(pd is not None and research_agents is not None, "research runtime dependencies are not installed")
 class ResearchAgentsTest(unittest.TestCase):
     def test_data_agent_writes_raw_and_analysis_files(self) -> None:
         idx = pd.date_range("2023-01-01", periods=5, freq="D", tz="UTC")
@@ -59,7 +68,11 @@ class ResearchAgentsTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.object(research_agents, "_project_root", return_value=Path(tmpdir)):
-                with patch.object(research_agents, "fetch_btc_data", return_value=frame):
+                with patch.object(
+                    research_agents,
+                    "fetch_btc_data_bundle",
+                    return_value={"15m": frame.copy(), "1h": frame.copy(), "4h": frame.copy(), "1d": frame.copy()},
+                ):
                     result = DataFetchAnalysisAgent(client=_FakeClient(llm_json), model="fake-model").run()
 
             self.assertTrue(Path(result.raw_path).exists())

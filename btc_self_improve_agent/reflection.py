@@ -96,3 +96,39 @@ Do not include markdown fences or any commentary.
 
     score = max(0, min(100, score))
     return score, lesson
+
+
+def self_reflect_month(
+    client: Any,
+    monthly_result: dict[str, Any],
+    system_prompt: str = "",
+    model: str = "claude-3-5-sonnet-20240620",
+) -> dict[str, Any]:
+    """Structured monthly reflection with score, lesson, and risk flags."""
+
+    score, lesson = self_reflect_trade(
+        client=client,
+        result={
+            "total_return": float(monthly_result.get("total_return", 0.0)),
+            "sharpe": float(monthly_result.get("sharpe", 0.0)),
+            "max_dd": float(monthly_result.get("max_dd", 0.0)),
+            "win_rate": float(monthly_result.get("win_rate", 0.0)),
+            "profit_factor": float(monthly_result.get("profit_factor", 0.0)),
+        },
+        system_prompt=system_prompt,
+        model=model,
+    )
+    risks: list[str] = []
+    if float(monthly_result.get("max_dd", 0.0)) > 25:
+        risks.append("drawdown_above_25")
+    if float(monthly_result.get("win_rate", 0.0)) < 40:
+        risks.append("low_win_rate")
+    if float(monthly_result.get("profit_factor", 0.0)) < 1.0:
+        risks.append("profit_factor_below_one")
+    if float(monthly_result.get("trade_count", 0.0)) < 3:
+        risks.append("too_few_trades")
+    return {
+        "score": score,
+        "lesson": lesson,
+        "risks": risks,
+    }

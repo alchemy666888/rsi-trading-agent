@@ -1,32 +1,34 @@
 from __future__ import annotations
 
+import json
 import os
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+import pandas as pd
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+from .config import DEFAULT_CONFIG
 from .memory import MemoryManager
-from .observability import trace_span
-from .planner import create_strategy_plan
-from .reflection import self_reflect_trade
-from .tools import execute_tool, write_backtest_report
+from .observability import trace_span, write_month_trace
+from .planner import DEFAULT_STRATEGY, create_strategy_plan, update_strategy_from_lesson
+from .reflection import self_reflect_month
+from .tools import (
+    compute_weekly_score,
+    run_backtest_simulation,
+    write_backtest_report,
+    write_final_strategy_markdown,
+    write_monthly_report,
+)
 
 
 def _resolve_model(model_override: str | None) -> str:
-    """Pick a default Anthropic model, allowing env overrides."""
-
-    # User-configurable env vars
     env_model = model_override or os.getenv("CLAUDE_MODEL") or os.getenv("ANTHROPIC_MODEL")
     if env_model:
         return env_model
-
-    # Stable fallbacks (newest first). Adjust as Anthropic updates versions.
-    fallbacks = [
-        "claude-3-5-sonnet-20240620",
-        "claude-3-sonnet-20240229",
-    ]
-    return fallbacks[0]
+    return "claude-3-5-sonnet-20240620"
 
 
 class BTCSelfImprovingAgent:
@@ -38,80 +40,193 @@ class BTCSelfImprovingAgent:
         self.client = Anthropic(api_key=key)
         self.model = _resolve_model(model)
         self.memory = MemoryManager(session_id=session_id)
+        self.session_id = session_id
+        self.config = DEFAULT_CONFIG
         self.system_prompt = (
-            "You are a BTC trading strategy optimizer. Use past lessons to improve. "
-            "Prefer multi-timeframe strategies that use 15m or 1h for entries, with 4h and 1d used as the trend "
-            "and confirmation layer. Treat news as a regime filter rather than a standalone trigger."
+            "You are a BTC trading strategy optimizer for a historical monthly walk-forward system. "
+            "Use 4h and 1d only for trend/regime context. Use 15m and 1h only for entries/exits. "
+            "Use sentiment and news impact timing as risk-regime modifiers, not standalone triggers."
         )
 
-    def _update_system_prompt(self, lesson: str) -> None:
-        self.system_prompt += f"\nNew lesson: {lesson}"
+    def run(
+        self,
+        user_goal: str,
+        *,
+        market_csv_paths: dict[str, str],
+        news_json_path: str,
+        epochs: int = 5,
+        require_confirmation: bool = False,
+    ) -> dict[str, Any]:
+        del epochs
+        del require_confirmation
 
-    def run(self, user_goal: str, epochs: int = 5, require_confirmation: bool = False) -> dict[str, Any]:
-        best_return = float("-inf")
-        best_result: dict[str, Any] = {}
+        market_frames = self._load_market_frames(market_csv_paths)
+        news_records = self._load_news(news_json_path)
+        monthly_ids = self.config.month_ids
 
-        with trace_span("btc_simulation") as trace:
-            for epoch in range(1, epochs + 1):
-                context = self.memory.get_relevant_lessons()
-                strategy = create_strategy_plan(self.client, user_goal, context, self.system_prompt, model=self.model)
+        context = self.memory.get_monthly_context(top_n=6)
+        strategy = create_strategy_plan(self.client, user_goal, context, self.system_prompt, model=self.model)
+        if not strategy:
+            strategy = dict(DEFAULT_STRATEGY)
 
-                data = execute_tool(
-                    {"name": "fetch_btc_data", "args": {"timeframe": "15m", "period": "2y"}},
-                    require_confirmation=False,
+        monthly_results: list[dict[str, Any]] = []
+        with trace_span("btc_monthly_walkforward") as trace:
+            for month_id in monthly_ids:
+                month_frames = self._slice_month_frames(market_frames, month_id)
+                if not month_frames or any(frame.empty for frame in month_frames.values()):
+                    continue
+                month_news = self._filter_news_for_month(news_records, month_id)
+
+                simulation = run_backtest_simulation(month_frames, news=month_news, strategy=strategy)
+                score = compute_weekly_score(simulation, weights={"sharpe": 25, "win_rate": 25, "max_dd": 30, "costs": 20})
+                reflection = self_reflect_month(self.client, simulation, system_prompt=self.system_prompt, model=self.model)
+                lesson = str(reflection.get("lesson", ""))
+                combined_score = (float(reflection.get("score", 50)) + score) / 2.0
+
+                updated_strategy, change_log = update_strategy_from_lesson(
+                    strategy,
+                    lesson=lesson,
+                    monthly_metrics=simulation,
+                    client=self.client,
+                    model=self.model,
                 )
-                indicators = execute_tool({"name": "resample_features", "args": {"raw": data}}, require_confirmation=False)
-                news_sentiment = execute_tool({"name": "fetch_btc_news", "args": {}}, require_confirmation=False)
-                backtest_result = execute_tool(
-                    {
-                        "name": "run_backtest_simulation",
-                        "args": {"indicators": indicators, "news": news_sentiment, "strategy": strategy},
-                    },
-                    require_confirmation=require_confirmation,
-                )
+                validation_flags = {
+                    "max_dd_breach": float(simulation.get("max_dd", 0.0)) > 25.0,
+                    "low_win_rate": float(simulation.get("win_rate", 0.0)) < 40.0,
+                    "low_trade_count": int(simulation.get("trade_count", 0)) < 3,
+                }
 
-                if "error" in backtest_result:
-                    trace["steps"].append({"epoch": epoch, "error": backtest_result["error"]})
-                    break
-
-                score, lesson = self_reflect_trade(self.client, backtest_result, self.system_prompt, model=self.model)
-
-                if backtest_result.get("max_dd", 0) > 30:
-                    score = max(0, score - 10)
-                    lesson = f"{lesson} Reduce drawdown below 30% by lowering risk exposure."
-
-                report_path = write_backtest_report(
-                    epoch=epoch,
+                monthly_report_path = write_monthly_report(
+                    month_id=month_id,
                     strategy=strategy,
-                    metrics=backtest_result,
-                    trades=backtest_result.get("trades", []),
+                    metrics=simulation,
+                    lesson=lesson,
+                )
+                month_trace_path = write_month_trace(
+                    month_id=month_id,
+                    payload={
+                        "strategy_before": strategy,
+                        "strategy_after": updated_strategy,
+                        "metrics": simulation,
+                        "score": combined_score,
+                        "lesson": lesson,
+                        "change_log": change_log,
+                        "validation_flags": validation_flags,
+                        "report_path": monthly_report_path,
+                    },
                 )
 
-                self.memory.store_strategy(strategy, backtest_result, score, lesson)
+                self.memory.store_monthly_strategy(
+                    month_id=month_id,
+                    strategy=strategy,
+                    metrics=simulation,
+                    score=combined_score,
+                    lesson=lesson,
+                    change_log=change_log,
+                    validation_flags=validation_flags,
+                )
+                self.memory.store_strategy(strategy, simulation, int(max(0, min(100, combined_score))), lesson)
 
-                trace["steps"].append(
+                monthly_results.append(
                     {
-                        "epoch": epoch,
-                        "strategy": strategy,
-                        "metrics": backtest_result,
-                        "score": score,
+                        "month_id": month_id,
+                        "score": combined_score,
                         "lesson": lesson,
-                        "report_path": report_path,
+                        "strategy_before": strategy,
+                        "strategy_after": updated_strategy,
+                        "metrics": simulation,
+                        "report_path": monthly_report_path,
+                        "trace_path": month_trace_path,
                     }
                 )
+                strategy = updated_strategy
+                trace["steps"].append(monthly_results[-1])
 
-                if backtest_result["total_return"] > best_return:
-                    best_return = backtest_result["total_return"]
-                    best_result = {
-                        "strategy": strategy,
-                        "metrics": backtest_result,
-                        "score": score,
-                        "lesson": lesson,
-                        "report_path": report_path,
-                    }
-                    self._update_system_prompt(lesson)
-
-                print(f"Epoch {epoch}: Total Return {backtest_result['total_return']:.2f}% | Score {score}")
-
+        final_strategy_path = write_final_strategy_markdown(strategy=strategy, monthly_history=monthly_results)
+        final_backtest = run_backtest_simulation(market_frames, news=news_records, strategy=strategy)
+        final_report_path = write_backtest_report(
+            epoch=999,
+            strategy=strategy,
+            metrics=final_backtest,
+            trades=final_backtest.get("trades", []),
+            title="Final Frozen Backtest Report",
+        )
+        stable_report_path = self._write_stable_final_backtest(final_report_path=final_report_path, metrics=final_backtest)
+        result = {
+            "final_strategy": strategy,
+            "final_strategy_markdown_path": final_strategy_path,
+            "final_backtest_report_path": stable_report_path,
+            "generated_backtest_path": final_report_path,
+            "final_metrics": final_backtest,
+            "monthly_results": monthly_results,
+        }
         self.memory.close()
-        return best_result
+        return result
+
+    def _load_market_frames(self, csv_paths: dict[str, str]) -> dict[str, pd.DataFrame]:
+        frames: dict[str, pd.DataFrame] = {}
+        for tf in self.config.timeframes:
+            path = csv_paths.get(tf)
+            if not path:
+                raise ValueError(f"Missing market csv path for timeframe: {tf}")
+            df = pd.read_csv(path)
+            if "timestamp" not in df.columns:
+                raise ValueError(f"{path} missing timestamp column")
+            df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+            df.set_index("timestamp", inplace=True)
+            frames[tf] = df.sort_index()
+        return frames
+
+    def _load_news(self, news_json_path: str) -> list[dict[str, Any]]:
+        path = Path(news_json_path)
+        if not path.exists():
+            return []
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+
+    def _slice_month_frames(self, frames: dict[str, pd.DataFrame], month_id: str) -> dict[str, pd.DataFrame]:
+        month_start = datetime.strptime(month_id + "-01", "%Y-%m-%d").replace(tzinfo=UTC)
+        if month_start.month == 12:
+            month_end = datetime(month_start.year + 1, 1, 1, tzinfo=UTC)
+        else:
+            month_end = datetime(month_start.year, month_start.month + 1, 1, tzinfo=UTC)
+        sliced: dict[str, pd.DataFrame] = {}
+        for tf, frame in frames.items():
+            sliced[tf] = frame[(frame.index >= month_start) & (frame.index < month_end)].copy()
+        return sliced
+
+    def _filter_news_for_month(self, news_records: list[dict[str, Any]], month_id: str) -> list[dict[str, Any]]:
+        month_start = datetime.strptime(month_id + "-01", "%Y-%m-%d").replace(tzinfo=UTC)
+        if month_start.month == 12:
+            month_end = datetime(month_start.year + 1, 1, 1, tzinfo=UTC)
+        else:
+            month_end = datetime(month_start.year, month_start.month + 1, 1, tzinfo=UTC)
+        rows: list[dict[str, Any]] = []
+        for item in news_records:
+            published = item.get("published_at")
+            if not published:
+                continue
+            try:
+                dt = datetime.fromisoformat(str(published).replace("Z", "+00:00")).astimezone(UTC)
+            except ValueError:
+                continue
+            if month_start <= dt < month_end:
+                rows.append(item)
+        return rows
+
+    def _write_stable_final_backtest(self, *, final_report_path: str, metrics: dict[str, Any]) -> str:
+        backtest_dir = Path(__file__).resolve().parent.parent / "backtest"
+        backtest_dir.mkdir(parents=True, exist_ok=True)
+        stable_path = backtest_dir / "final_strategy_backtest_report.md"
+        source = Path(final_report_path)
+        if source.exists():
+            stable_path.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        else:
+            fallback = [
+                "# Final Frozen Backtest Report",
+                "",
+                f"- Generated At: {datetime.now(UTC).isoformat()}",
+                f"- Total Return: {metrics.get('total_return', 'N/A')}",
+            ]
+            stable_path.write_text("\n".join(fallback) + "\n", encoding="utf-8")
+        return str(stable_path)

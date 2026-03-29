@@ -2,6 +2,7 @@ import unittest
 
 from btc_self_improve_agent.planner import _extract_json_object as extract_plan_json
 from btc_self_improve_agent.planner import _sanitize_strategy
+from btc_self_improve_agent.planner import update_strategy_from_lesson
 from btc_self_improve_agent.reflection import _extract_json_object as extract_reflection_json
 
 
@@ -21,6 +22,17 @@ class PlannerReflectionTest(unittest.TestCase):
         self.assertGreaterEqual(strategy["rsi_buy"], 5)
         self.assertLessEqual(strategy["rsi_sell"], 95)
         self.assertLess(strategy["ma_short"], strategy["ma_long"])
+
+    def test_update_strategy_from_lesson_returns_change_log(self):
+        strategy, change_log = update_strategy_from_lesson(
+            {"rsi_buy": 30, "rsi_sell": 70, "max_position": 1.0},
+            lesson="Drawdown too high after news shock, reduce risk.",
+            monthly_metrics={"max_dd": 30.0, "win_rate": 42.0, "sharpe": 0.4},
+            client=None,
+        )
+        self.assertIn("max_position", strategy)
+        self.assertIsInstance(change_log, dict)
+        self.assertIn("changes", change_log)
 
 
 if __name__ == "__main__":
