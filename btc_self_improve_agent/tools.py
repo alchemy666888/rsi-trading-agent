@@ -660,8 +660,8 @@ def _run_multi_timeframe_backtest(
     short_idx = (short_setup & higher_short).to_numpy()
     signal[long_idx] = 1.0
     signal[short_idx] = -1.0
-    signal[higher_aligned] *= resonance
-    signal[~higher_aligned] *= conflict_penalty
+    signal[np.where(higher_aligned.to_numpy(), True, False)] *= resonance
+    signal[np.where(~higher_aligned.to_numpy(), True, False)] *= conflict_penalty
 
     # News impact: use enriched historical events with impact windows.
     impact_series = compute_news_impact_series(base.index, enrich_news_records(news or []))
