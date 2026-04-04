@@ -7,8 +7,8 @@ from typing import Any
 
 DEFAULT_STRATEGY: dict[str, Any] = {
     "strategy_name": "btc_multi_tf_news_regime_v1",
-    "rsi_buy": 30,
-    "rsi_sell": 70,
+    "rsi_buy": 42,
+    "rsi_sell": 62,
     "rsi_fast_period": 7,
     "ma_short": 10,
     "ma_long": 50,
@@ -25,14 +25,29 @@ DEFAULT_STRATEGY: dict[str, Any] = {
     "ichimoku_span_b_period": 52,
     "vwap_window": 20,
     "volume_profile_window": 96,
-    "news_weight": 0.3,
-    "weight_resonance": 1.1,
-    "conflict_penalty": 0.4,
-    "max_position": 1.0,
-    "stop_atr_multiple": 1.8,
-    "take_profit_atr_multiple": 2.8,
-    "cooldown_bars_after_news": 4,
-    "trend_filter_strength": 0.6,
+    "news_weight": 0.12,
+    "weight_resonance": 1.08,
+    "conflict_penalty": 0.45,
+    "max_position": 0.55,
+    "stop_atr_multiple": 2.6,
+    "take_profit_atr_multiple": 5.0,
+    "cooldown_bars_after_news": 8,
+    "trend_filter_strength": 0.62,
+    "entry_timeframe": "auto",
+    "long_score_threshold": 0.82,
+    "short_score_threshold": 0.95,
+    "score_hysteresis": 0.08,
+    "max_hold_bars": 192,
+    "breakeven_r_multiple": 1.0,
+    "news_impact_cap": 0.6,
+    "long_pullback_rsi_1h": 46,
+    "long_pullback_rsi_15m": 44,
+    "breakout_volume_surge": 1.20,
+    "short_breakdown_volume_surge": 1.60,
+    "short_rally_rsi_1h": 58,
+    "trade_cooldown_bars": 32,
+    "breakout_1h_window": 72,
+    "breakout_15m_window": 32,
 }
 
 
@@ -60,7 +75,7 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 def _sanitize_strategy(raw: dict[str, Any]) -> dict[str, Any]:
     out = DEFAULT_STRATEGY.copy()
 
-    entry_timeframe = str(raw.get("entry_timeframe", "auto")).lower()
+    entry_timeframe = str(raw.get("entry_timeframe", out.get("entry_timeframe", "auto"))).lower()
     out["entry_timeframe"] = entry_timeframe if entry_timeframe in {"15m", "1h", "auto"} else "auto"
 
     def _num(name: str, lo: float, hi: float) -> None:
@@ -95,6 +110,20 @@ def _sanitize_strategy(raw: dict[str, Any]) -> dict[str, Any]:
     _num("take_profit_atr_multiple", 0.5, 8)
     _num("cooldown_bars_after_news", 0, 48)
     _num("trend_filter_strength", 0, 1)
+    _num("long_score_threshold", 0.4, 0.95)
+    _num("short_score_threshold", 0.4, 0.95)
+    _num("score_hysteresis", 0.0, 0.4)
+    _num("max_hold_bars", 4, 480)
+    _num("breakeven_r_multiple", 0.5, 3.0)
+    _num("news_impact_cap", 0.2, 2.0)
+    _num("long_pullback_rsi_1h", 20, 65)
+    _num("long_pullback_rsi_15m", 15, 60)
+    _num("breakout_volume_surge", 1.0, 3.0)
+    _num("short_breakdown_volume_surge", 1.0, 3.0)
+    _num("short_rally_rsi_1h", 45, 85)
+    _num("trade_cooldown_bars", 0, 96)
+    _num("breakout_1h_window", 12, 240)
+    _num("breakout_15m_window", 8, 192)
 
     if out["ma_short"] >= out["ma_long"]:
         out["ma_short"] = min(out["ma_long"] - 1, out["ma_short"])
@@ -106,6 +135,8 @@ def _sanitize_strategy(raw: dict[str, Any]) -> dict[str, Any]:
         out["ichimoku_conversion_period"] = max(5, out["ichimoku_base_period"] - 1)
     if out["ichimoku_base_period"] >= out["ichimoku_span_b_period"]:
         out["ichimoku_base_period"] = max(10, out["ichimoku_span_b_period"] - 1)
+    if out["long_score_threshold"] > out["short_score_threshold"]:
+        out["short_score_threshold"] = min(0.95, out["long_score_threshold"] + 0.02)
 
     return out
 
@@ -130,9 +161,10 @@ User goal: {user_goal}
 Past lessons: {context}
 
 Return only JSON for BTC multi-timeframe strategy parameters.
-Use 15m or 1h as the entry timeframe and use 4h and 1d as the higher-timeframe trend and signal filter.
-Treat news sentiment as a regime filter, not a standalone trigger.
-Example: {{"entry_timeframe": "auto", "rsi_buy": 30, "rsi_sell": 70, "weight_resonance": 1.1, "conflict_penalty": 0.4, "news_weight": 0.5}}
+Use 1d for macro bias, 4h for confirmation, 1h for setup confirmation, and 15m for trigger timing.
+Keep BTC structurally long-biased unless the 1d macro regime is decisively bearish.
+Treat news sentiment as an asymmetric risk modifier, not a standalone trigger.
+Example: {{"entry_timeframe": "auto", "rsi_buy": 42, "rsi_sell": 62, "weight_resonance": 1.08, "conflict_penalty": 0.45, "news_weight": 0.12}}
 Do not include markdown fences or any commentary.
 """
 
@@ -246,20 +278,46 @@ def _rule_based_strategy_update(base: dict[str, Any], lesson: str, metrics: dict
     max_dd = float(metrics.get("max_dd", 0.0))
     win_rate = float(metrics.get("win_rate", 0.0))
     sharpe = float(metrics.get("sharpe", 0.0))
+    trade_count = float(metrics.get("trade_count", 0.0))
+    profit_factor = float(metrics.get("profit_factor", 0.0))
+    total_return = float(metrics.get("total_return", 0.0))
+    trades = metrics.get("trades", []) if isinstance(metrics.get("trades", []), list) else []
+    long_count = sum(1 for trade in trades if str(trade.get("side", "")).lower().startswith("long"))
+    short_count = sum(1 for trade in trades if str(trade.get("side", "")).lower().startswith("short"))
 
     if max_dd > 25:
-        updated["max_position"] = max(0.2, float(updated["max_position"]) * 0.9)
-        updated["stop_atr_multiple"] = max(0.8, float(updated["stop_atr_multiple"]) - 0.1)
+        updated["max_position"] = max(0.4, float(updated["max_position"]) * 0.92)
+    if trade_count < 12:
+        updated["long_score_threshold"] = max(0.68, float(updated["long_score_threshold"]) - 0.01)
+        updated["breakout_volume_surge"] = max(1.1, float(updated["breakout_volume_surge"]) - 0.03)
+        updated["max_hold_bars"] = min(144, float(updated["max_hold_bars"]) + 6)
+        updated["trade_cooldown_bars"] = max(8, float(updated["trade_cooldown_bars"]) - 2)
+    if total_return < 0 and profit_factor < 1.0:
+        updated["news_weight"] = max(0.05, float(updated["news_weight"]) - 0.02)
+        updated["short_score_threshold"] = min(0.95, float(updated["short_score_threshold"]) + 0.02)
+        updated["conflict_penalty"] = min(0.8, float(updated["conflict_penalty"]) + 0.03)
+        updated["trade_cooldown_bars"] = min(48, float(updated["trade_cooldown_bars"]) + 2)
+        if short_count > 0:
+            updated["short_breakdown_volume_surge"] = min(2.2, float(updated["short_breakdown_volume_surge"]) + 0.05)
+        if long_count <= short_count:
+            updated["long_score_threshold"] = max(0.68, float(updated["long_score_threshold"]) - 0.01)
+    if total_return < 0 and win_rate < 42 and long_count > 0:
+        updated["long_pullback_rsi_15m"] = max(30, float(updated["long_pullback_rsi_15m"]) - 1)
+        updated["long_pullback_rsi_1h"] = max(34, float(updated["long_pullback_rsi_1h"]) - 1)
     if "early" in lesson_l or "late" in lesson_l:
-        updated["rsi_buy"] = min(45, float(updated["rsi_buy"]) + 1)
-        updated["rsi_sell"] = max(55, float(updated["rsi_sell"]) - 1)
+        updated["long_score_threshold"] = max(0.68, float(updated["long_score_threshold"]) - 0.01)
+        updated["score_hysteresis"] = min(0.12, float(updated["score_hysteresis"]) + 0.01)
     if "news" in lesson_l or "headline" in lesson_l:
-        updated["news_weight"] = min(1.2, float(updated["news_weight"]) + 0.05)
-        updated["cooldown_bars_after_news"] = min(24, float(updated["cooldown_bars_after_news"]) + 1)
+        updated["news_weight"] = max(0.05, float(updated["news_weight"]) - 0.02)
+        updated["cooldown_bars_after_news"] = min(16, float(updated["cooldown_bars_after_news"]) + 1)
     if win_rate < 45:
-        updated["conflict_penalty"] = min(0.8, float(updated["conflict_penalty"]) + 0.05)
-    if sharpe < 0.8:
-        updated["weight_resonance"] = min(1.6, float(updated["weight_resonance"]) + 0.03)
+        updated["rsi_sell"] = min(70, float(updated["rsi_sell"]) + 1)
+        updated["short_rally_rsi_1h"] = min(65, float(updated["short_rally_rsi_1h"]) + 1)
+    if sharpe < 0.5:
+        updated["weight_resonance"] = min(1.2, float(updated["weight_resonance"]) + 0.01)
+    elif sharpe > 1.0 and total_return > 0:
+        updated["max_position"] = min(1.0, float(updated["max_position"]) * 1.03)
+        updated["weight_resonance"] = min(1.2, float(updated["weight_resonance"]) + 0.01)
 
     return _sanitize_strategy(updated)
 

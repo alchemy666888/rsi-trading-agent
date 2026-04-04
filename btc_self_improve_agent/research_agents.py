@@ -87,6 +87,52 @@ def _parse_any_datetime(value: Any) -> datetime | None:
     return None
 
 
+def _extract_datetime_from_text(text: str) -> datetime | None:
+    text = str(text or "").strip()
+    if not text:
+        return None
+
+    # Common date patterns found in URLs/titles/snippets.
+    patterns = [
+        r"(?P<y>20\d{2})[-_/](?P<m>0[1-9]|1[0-2])[-_/](?P<d>0[1-9]|[12]\d|3[01])",
+        r"(?P<y>20\d{2})(?P<m>0[1-9]|1[0-2])(?P<d>0[1-9]|[12]\d|3[01])",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        try:
+            dt = datetime(
+                int(match.group("y")),
+                int(match.group("m")),
+                int(match.group("d")),
+                tzinfo=UTC,
+            )
+            return dt
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_published_datetime(row: dict[str, Any]) -> tuple[datetime | None, str]:
+    direct = _parse_any_datetime(row.get("date") or row.get("published_at") or row.get("published"))
+    if direct is not None:
+        return direct, "high"
+
+    text = " ".join(
+        str(row.get(k) or "")
+        for k in ("title", "body", "snippet", "url", "href")
+    ).strip()
+    inferred = _extract_datetime_from_text(text)
+    if inferred is not None:
+        return inferred, "medium"
+    return None, "low"
+
+
+def _confidence_rank(value: str) -> int:
+    return {"high": 3, "medium": 2, "low": 1}.get(str(value).lower(), 0)
+
+
 @dataclass
 class ResearchResult:
     raw_path: str
@@ -368,19 +414,42 @@ class NewsFetchAnalysisAgent:
                 url = str(row.get("href") or row.get("url") or "").strip()
                 title = str(row.get("title") or "").strip()
                 snippet = str(row.get("body") or row.get("snippet") or "").strip()
-                published_at = _parse_any_datetime(row.get("date"))
+                published_at, published_confidence = _extract_published_datetime(row)
                 key = url or title
                 if not key:
                     continue
-                dedup[key] = {
+
+                if published_at is None:
+                    # Skip records without any timestamp signal to avoid injecting fake chronology.
+                    continue
+                if published_at < (start_dt - timedelta(days=2)) or published_at > (end_dt + timedelta(days=2)):
+                    continue
+
+                candidate = {
                     "title": title,
                     "url": url,
                     "snippet": snippet,
                     "source": str(row.get("source") or ""),
-                    "published_at": published_at.isoformat() if published_at else cursor.isoformat(),
+                    "published_at": published_at.isoformat(),
+                    "published_at_confidence": published_confidence,
                     "search_window_start": cursor.isoformat(),
                     "search_window_end": window_end.isoformat(),
                 }
+                existing = dedup.get(key)
+                if existing is None:
+                    dedup[key] = candidate
+                    continue
+
+                existing_rank = _confidence_rank(existing.get("published_at_confidence", ""))
+                candidate_rank = _confidence_rank(candidate.get("published_at_confidence", ""))
+                if candidate_rank > existing_rank:
+                    dedup[key] = candidate
+                    continue
+                if candidate_rank == existing_rank:
+                    existing_dt = _parse_any_datetime(existing.get("published_at"))
+                    candidate_dt = _parse_any_datetime(candidate.get("published_at"))
+                    if existing_dt is None or (candidate_dt is not None and candidate_dt < existing_dt):
+                        dedup[key] = candidate
             cursor = window_end + timedelta(days=1)
         return sorted(dedup.values(), key=lambda item: item.get("published_at", ""))
 

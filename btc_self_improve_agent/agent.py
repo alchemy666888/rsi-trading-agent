@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,48 @@ def _resolve_model(model_override: str | None) -> str:
     if env_model:
         return env_model
     return "claude-3-5-sonnet-20240620"
+
+
+def _extract_side_trade_counts(simulation: dict[str, Any]) -> tuple[int, int]:
+    long_count = 0
+    short_count = 0
+    for trade in simulation.get("trades", []) or []:
+        side = str(trade.get("side", "")).lower()
+        if side.startswith("long"):
+            long_count += 1
+        elif side.startswith("short"):
+            short_count += 1
+    return long_count, short_count
+
+
+def _should_apply_monthly_update(
+    simulation: dict[str, Any],
+    *,
+    recent_history: list[dict[str, Any]] | None = None,
+    min_trade_count: int = 12,
+    min_active_months: int = 1,
+    min_trades_per_side: int = 0,
+) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    history = [item for item in (recent_history or []) if isinstance(item, dict)]
+    review_window = history + [simulation]
+    aggregate_trade_count = sum(int(item.get("trade_count", 0) or 0) for item in review_window)
+    active_months = sum(1 for item in review_window if int(item.get("trade_count", 0) or 0) >= 3)
+    if active_months < min_active_months:
+        reasons.append(f"insufficient_active_months<{min_active_months}")
+    if aggregate_trade_count < min_trade_count:
+        reasons.append(f"insufficient_trade_count<{min_trade_count}")
+
+    long_count = 0
+    short_count = 0
+    for item in review_window:
+        item_long_count, item_short_count = _extract_side_trade_counts(item)
+        long_count += item_long_count
+        short_count += item_short_count
+    if min_trades_per_side > 0 and aggregate_trade_count >= min_trade_count and min(long_count, short_count) < min_trades_per_side:
+        reasons.append("one_sided_trade_distribution")
+
+    return len(reasons) == 0, reasons
 
 
 class BTCSelfImprovingAgent:
@@ -72,41 +114,66 @@ class BTCSelfImprovingAgent:
         monthly_results: list[dict[str, Any]] = []
         with trace_span("btc_monthly_walkforward") as trace:
             for month_id in monthly_ids:
+                month_start, month_end = self._month_bounds(month_id)
                 month_frames = self._slice_month_frames(market_frames, month_id)
                 if not month_frames or any(frame.empty for frame in month_frames.values()):
                     continue
                 month_news = self._filter_news_for_month(news_records, month_id)
 
-                simulation = run_backtest_simulation(month_frames, news=month_news, strategy=strategy)
+                simulation = run_backtest_simulation(
+                    month_frames,
+                    news=month_news,
+                    strategy=strategy,
+                    evaluation_start=month_start,
+                    # Include bars that close exactly at month boundary while still excluding next-month opens.
+                    evaluation_end=month_end + timedelta(hours=1),
+                )
                 score = compute_weekly_score(simulation, weights={"sharpe": 25, "win_rate": 25, "max_dd": 30, "costs": 20})
                 reflection = self_reflect_month(self.client, simulation, system_prompt=self.system_prompt, model=self.model)
                 lesson = str(reflection.get("lesson", ""))
                 combined_score = (float(reflection.get("score", 50)) + score) / 2.0
 
-                updated_strategy, change_log = update_strategy_from_lesson(
-                    strategy,
-                    lesson=lesson,
-                    monthly_metrics=simulation,
-                    client=self.client,
-                    model=self.model,
+                can_update, gating_reasons = _should_apply_monthly_update(
+                    simulation,
+                    recent_history=[item["metrics"] for item in monthly_results[-2:]],
+                    min_trade_count=12,
+                    min_active_months=2,
+                    min_trades_per_side=0,
                 )
+                if can_update:
+                    updated_strategy, change_log = update_strategy_from_lesson(
+                        strategy,
+                        lesson=lesson,
+                        monthly_metrics=simulation,
+                        client=self.client,
+                        model=self.model,
+                    )
+                else:
+                    updated_strategy = dict(strategy)
+                    change_log = {
+                        "summary": "Skipped strategy parameter update due insufficient monthly evidence.",
+                        "changes": [],
+                        "gating_reasons": gating_reasons,
+                    }
                 validation_flags = {
                     "max_dd_breach": float(simulation.get("max_dd", 0.0)) > 25.0,
                     "low_win_rate": float(simulation.get("win_rate", 0.0)) < 40.0,
                     "low_trade_count": int(simulation.get("trade_count", 0)) < 3,
+                    "update_skipped": not can_update,
+                    "update_gating_reasons": gating_reasons,
                 }
 
                 monthly_report_path = write_monthly_report(
                     month_id=month_id,
-                    strategy=strategy,
+                    strategy=dict(strategy),
                     metrics=simulation,
                     lesson=lesson,
                 )
                 month_trace_path = write_month_trace(
                     month_id=month_id,
                     payload={
-                        "strategy_before": strategy,
-                        "strategy_after": updated_strategy,
+                        "strategy_before": dict(strategy),
+                        "strategy_after": dict(updated_strategy),
                         "metrics": simulation,
                         "score": combined_score,
                         "lesson": lesson,
@@ -118,7 +185,7 @@ class BTCSelfImprovingAgent:
 
                 self.memory.store_monthly_strategy(
                     month_id=month_id,
-                    strategy=strategy,
+                    strategy=dict(strategy),
                     metrics=simulation,
                     score=combined_score,
                     lesson=lesson,
@@ -132,8 +199,8 @@ class BTCSelfImprovingAgent:
                         "month_id": month_id,
                         "score": combined_score,
                         "lesson": lesson,
-                        "strategy_before": strategy,
-                        "strategy_after": updated_strategy,
+                        "strategy_before": dict(strategy),
+                        "strategy_after": dict(updated_strategy),
                         "metrics": simulation,
                         "report_path": monthly_report_path,
                         "trace_path": month_trace_path,
@@ -184,23 +251,37 @@ class BTCSelfImprovingAgent:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, list) else []
 
-    def _slice_month_frames(self, frames: dict[str, pd.DataFrame], month_id: str) -> dict[str, pd.DataFrame]:
+    def _month_bounds(self, month_id: str) -> tuple[datetime, datetime]:
         month_start = datetime.strptime(month_id + "-01", "%Y-%m-%d").replace(tzinfo=UTC)
         if month_start.month == 12:
             month_end = datetime(month_start.year + 1, 1, 1, tzinfo=UTC)
         else:
             month_end = datetime(month_start.year, month_start.month + 1, 1, tzinfo=UTC)
+        return month_start, month_end
+
+    def _slice_month_frames(
+        self,
+        frames: dict[str, pd.DataFrame],
+        month_id: str,
+        *,
+        warmup_days: int = 365,
+    ) -> dict[str, pd.DataFrame]:
+        month_start, month_end = self._month_bounds(month_id)
+        window_start = month_start - timedelta(days=warmup_days)
         sliced: dict[str, pd.DataFrame] = {}
         for tf, frame in frames.items():
-            sliced[tf] = frame[(frame.index >= month_start) & (frame.index < month_end)].copy()
+            sliced[tf] = frame[(frame.index >= window_start) & (frame.index < month_end)].copy()
         return sliced
 
-    def _filter_news_for_month(self, news_records: list[dict[str, Any]], month_id: str) -> list[dict[str, Any]]:
-        month_start = datetime.strptime(month_id + "-01", "%Y-%m-%d").replace(tzinfo=UTC)
-        if month_start.month == 12:
-            month_end = datetime(month_start.year + 1, 1, 1, tzinfo=UTC)
-        else:
-            month_end = datetime(month_start.year, month_start.month + 1, 1, tzinfo=UTC)
+    def _filter_news_for_month(
+        self,
+        news_records: list[dict[str, Any]],
+        month_id: str,
+        *,
+        lookback_days: int = 7,
+    ) -> list[dict[str, Any]]:
+        month_start, month_end = self._month_bounds(month_id)
+        window_start = month_start - timedelta(days=lookback_days)
         rows: list[dict[str, Any]] = []
         for item in news_records:
             published = item.get("published_at")
@@ -210,7 +291,7 @@ class BTCSelfImprovingAgent:
                 dt = datetime.fromisoformat(str(published).replace("Z", "+00:00")).astimezone(UTC)
             except ValueError:
                 continue
-            if month_start <= dt < month_end:
+            if window_start <= dt < month_end:
                 rows.append(item)
         return rows
 

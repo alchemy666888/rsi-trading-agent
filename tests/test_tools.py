@@ -59,7 +59,17 @@ class ToolsTest(unittest.TestCase):
         strategy = {"entry_timeframe": "auto", "rsi_buy": 35, "rsi_sell": 65, "news_weight": 0.4}
         result = run_backtest_simulation(self.frames, news=[{"sentiment": 0.2}], strategy=strategy)
 
-        for key in ["total_return", "sharpe", "max_dd", "win_rate", "profit_factor", "trade_count", "entry_timeframe", "execution_timeframe"]:
+        for key in [
+            "total_return",
+            "sharpe",
+            "max_dd",
+            "win_rate",
+            "profit_factor",
+            "trade_count",
+            "entry_timeframe",
+            "execution_timeframe",
+            "reliability_flags",
+        ]:
             self.assertIn(key, result)
         self.assertEqual(result["entry_timeframe"], "auto")
         self.assertEqual(result["execution_timeframe"], "15m")
@@ -107,6 +117,29 @@ class ToolsTest(unittest.TestCase):
             self.assertIn("Exit Rationale", content)
             self.assertIn("Entry Price", content)
             self.assertIn("Exit Price", content)
+            self.assertIn("Reliability Flags", content)
+
+    def test_backtest_metrics_use_trade_level_win_rate(self):
+        indicators = {
+            "timestamp": pd.date_range("2024-01-01", periods=8, freq="D", tz="UTC"),
+            "Open": [100, 101, 103, 102, 99, 98, 100, 101],
+            "High": [101, 104, 104, 103, 100, 101, 102, 103],
+            "Low": [99, 100, 101, 98, 97, 97, 99, 100],
+            "Close": [100, 103, 102, 99, 98, 100, 101, 102],
+            "Volume": [1000] * 8,
+            "RSI": [35, 25, 40, 75, 72, 45, 28, 55],
+            "MACD": [0.1, 0.8, 0.4, -0.7, -0.5, 0.2, 0.9, 0.3],
+            "MACD_signal": [0.2, 0.4, 0.5, -0.4, -0.3, 0.1, 0.4, 0.2],
+        }
+        result = run_backtest_simulation(indicators, strategy={"rsi_buy": 30, "rsi_sell": 70})
+
+        self.assertEqual(result["trade_count"], len(result["trades"]))
+        trade_wins = (
+            sum(1 for trade in result["trades"] if float(trade["return_pct"]) > 0) / len(result["trades"]) * 100
+            if result["trades"]
+            else 0.0
+        )
+        self.assertAlmostEqual(result["win_rate"], trade_wins, places=6)
 
 
 if __name__ == "__main__":

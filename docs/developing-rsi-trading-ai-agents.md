@@ -1,702 +1,447 @@
-# Developing RSI Trading AI Agents: A Self-Improving BTC Paper-Trading Blueprint
+# Developing RSI Trading AI Agents: Current BTC Strategy Design and Runtime Logic
 
-## 1. Mission and Scope
+## 1. Purpose
 
-This document upgrades the earlier generic AI-agent design into a concrete blueprint for a **recurring self-learning and self-improving BTC trading agent**. The target system is not a chatbot and not a one-off backtest script. It is a research-and-execution agent system that repeatedly:
+This document describes the current implemented design of the BTC self-improving trading agent in this repository. It replaces the earlier aspirational blueprint with a code-aligned explanation of how the system now works.
 
-1. downloads and organizes historical BTC market data and historical crypto news,
-2. pre-calculates multi-timeframe indicators and market structure features,
-3. analyzes news sentiment and news-to-price impact duration,
-4. performs historical paper trading with strict multi-timeframe logic,
-5. evaluates monthly performance and extracts lessons,
-6. updates its strategy rules and decision policy for the next month,
-7. converges toward a final strategy,
-8. documents that final strategy in markdown, and
-9. runs a full historical backtest with a detailed backtest report.
+The implementation is built around four ideas:
 
-The full research period is:
+1. use `1d` for slow macro bias,
+2. use `4h` for directional confirmation,
+3. use `1h` to confirm the setup shape,
+4. use `15m` to trigger and manage execution.
 
-- **Market data range**: `2023-01-01` to `2025-12-31`
-- **Primary asset**: `BTCUSDT`
-- **Execution style**: historical paper trading and backtesting only
-- **Required timeframes**: `15m`, `1h`, `4h`, `1d`
-- **Higher-timeframe context**: `4h` and `1d`
-- **Lower-timeframe entry/exit**: `15m` and `1h`
+The system is intentionally long-biased for BTC unless the daily regime is decisively bearish. News is treated as a risk modifier and cooldown filter, not as a standalone trade trigger.
 
-This document is intentionally written as a system design and operating blueprint so it can guide implementation later without changing the current codebase now.
+## 2. Code Map
 
----
+The main runtime is split across these modules:
 
-## 2. Core Agent Foundations for Quant Trading
-
-### 2.1 AI Agent Core Structure
+- `btc_self_improve_agent/agent.py`: monthly walk-forward orchestration, warmup windows, monthly update gating, final report generation.
+- `btc_self_improve_agent/planner.py`: default strategy parameters, parameter sanitization, LLM-guided strategy planning, conservative rule-based updates.
+- `btc_self_improve_agent/tools.py`: indicator calculation, news enrichment, multi-timeframe signal generation, position simulation, metrics, reports.
+- `btc_self_improve_agent/reflection.py`: monthly lessons and deterministic overrides when evidence is sparse or weak.
 
-An effective trading AI agent still follows the classical agent model:
+## 3. Data Inputs and Preprocessing
 
-- **Brain**: LLM reasoning layer for planning, synthesis, reflection, hypothesis generation, and strategy revision.
-- **Environment**: historical market data, historical news corpus, indicator store, paper-trading simulator, report outputs, and strategy memory.
-- **Sensors**: Binance market-data API responses, news APIs or historical news archives, computed indicators, event calendars, prior-month performance metrics, and risk summaries.
-- **Actuators**: data ingestion jobs, feature calculators, sentiment analyzers, trade simulators, report generators, and strategy-updating workflows.
-- **Loop**: perceive -> reason -> act -> evaluate -> learn -> update -> repeat.
+### 3.1 Market data
 
-### 2.2 Trading-Specific Agent Loop
+The runtime expects BTC OHLCV data for these timeframes:
 
-For this project, the loop is:
+- `15m`
+- `1h`
+- `4h`
+- `1d`
 
-1. **Perceive**
-   Load BTC OHLCV data, historical news, indicator tables, prior lessons, and current month trading context.
-2. **Reason**
-   Interpret higher-timeframe trend, lower-timeframe entry conditions, news regime, volatility regime, and risk constraints.
-3. **Act**
-   Execute paper trades on historical data using only information available up to each historical timestamp.
-4. **Evaluate**
-   Score trades and monthly performance using return, Sharpe, drawdown, expectancy, win/loss structure, regime behavior, and news-impact quality.
-5. **Learn**
-   Extract lessons such as “trend filter too loose,” “news shock requires longer cooldown,” or “RSI mean-reversion failed in breakout regimes.”
-6. **Improve**
-   Update strategy parameters, rule weights, regime filters, news-handling logic, risk rules, and entry/exit thresholds for the next month.
-7. **Repeat**
-   Roll the updated strategy into the next historical month and continue until the full dataset is completed.
+Each frame is coerced to a UTC datetime index, sorted, deduplicated, and gap-filled. Missing OHLCV gaps are forward-filled conservatively so indicator windows remain stable.
 
-This is the essential mechanism that fulfills the requirement for **recurring self-learning and self-improvement**.
+### 3.2 Timestamp handling
 
----
+After coercion, each frame index is shifted forward by exactly one bar length. This aligns each row to candle close time, which reduces lookahead risk when lower and higher timeframes are joined.
 
-## 3. Target System Architecture
+### 3.3 Monthly walk-forward windows
 
-The upgraded agent should be designed as a **multi-agent research-and-trading workflow**, not a single monolithic agent.
+Monthly simulation does not trade on a cold start. For each month, the agent loads:
 
-### 3.1 Recommended Agent Roles
+- the target month,
+- a `365` day market-data warmup window before that month,
+- a `7` day news lookback before that month.
 
-- **Orchestrator Agent**
-  Controls the monthly workflow, delegates tasks, enforces sequencing, and maintains run state.
-- **Market Data Agent**
-  Downloads BTC historical OHLCV and volume data from Binance, validates completeness, and standardizes timestamps.
-- **Feature Engineering Agent**
-  Pre-calculates indicators and market-structure features for all required timeframes.
-- **News Intelligence Agent**
-  Downloads or ingests historical BTC/crypto/Web3 news, tags themes, scores sentiment, and estimates price-impact lag and duration.
-- **Regime Analysis Agent**
-  Determines bull/bear/range conditions, volatility regimes, trend strength, and cross-timeframe alignment.
-- **Paper Trading Agent**
-  Simulates decisions candle by candle using only historically available data.
-- **Reflection and Learning Agent**
-  Reviews monthly outcomes, identifies failure patterns, and proposes strategy updates.
-- **Strategy Authoring Agent**
-  Consolidates the best learned policy into a final markdown trading strategy.
-- **Backtest Report Agent**
-  Runs the final strategy across the full period and writes a detailed backtest report.
-
-### 3.2 Why Multi-Agent Matters
-
-This separation is important because the system must do three different kinds of work well:
-
-- deterministic data processing,
-- probabilistic reasoning and synthesis,
-- iterative self-improvement.
-
-A specialized architecture reduces hallucination, improves observability, and makes monthly learning auditable.
-
----
-
-## 4. Historical Market Data Requirement: Binance Free API
-
-### 4.1 Required Market Dataset
-
-The agent must be able to call the **Binance free API** and download BTC historical price and volume data for:
-
-- **Symbol**: `BTCUSDT`
-- **Date range**: `2023-01-01 00:00:00 UTC` to `2025-12-31 23:59:59 UTC`
-- **Intervals**:
-  - `15m`
-  - `1h`
-  - `4h`
-  - `1d`
-
-### 4.2 Required Fields
-
-For each candle, the dataset should include at minimum:
-
-- open time
-- open
-- high
-- low
-- close
-- volume
-- close time
-- quote asset volume
-- number of trades
-- taker buy base asset volume
-- taker buy quote asset volume
-
-### 4.3 Data Quality Rules
-
-The Market Data Agent should enforce:
-
-- no missing candles inside the target range,
-- consistent timezone handling, ideally normalized to UTC internally,
-- no duplicate rows,
-- exact interval continuity,
-- validation that resampled and directly downloaded interval data align,
-- metadata logging for source, request time, completeness, and checksum.
-
-### 4.4 Why Direct Multi-Timeframe Data Matters
-
-Even if resampling is possible, the design should retain explicit timeframe-aware datasets because:
-
-- `1d` and `4h` define market context and directional bias,
-- `1h` and `15m` define tactical entries and exits,
-- feature timing and indicator lag can differ materially by timeframe,
-- news impact often appears first on lower timeframes but confirms on higher ones.
-
----
-
-## 5. Indicator and Feature Pre-Calculation Layer
-
-### 5.1 Indicator Philosophy
-
-The agent should **pre-calculate indicators before paper trading**, not compute them ad hoc during every reasoning step. This improves consistency, reproducibility, speed, and auditability.
-
-### 5.2 Required Indicator Families
-
-The system should compute indicators across the required timeframes as applicable:
-
-- **Trend and smoothing**
-  - SMA
-  - EMA
-  - MA variants across multiple lookbacks
-- **Momentum**
-  - RSI
-  - MACD
-  - MACD histogram
-  - rate of change
-- **Volatility**
-  - Bollinger Bands
-  - band width
-  - ATR
-- **Structure and trend state**
-  - Ichimoku Cloud
-  - cloud position
-  - Tenkan/Kijun alignment
-  - future cloud bias
-- **Volume and participation**
-  - VWAP
-  - rolling VWAP
-  - volume surge ratios
-  - taker-buy imbalance
-- **Market profile / auction context**
-  - Volume Profile
-  - high-volume node zones
-  - low-volume node zones
-  - value area high / low
-- **Supportive context features**
-  - swing high / low markers
-  - trend slope
-  - candle body-to-range ratio
-  - gap and breakout flags
-  - realized volatility
-
-### 5.3 Timeframe-Aware Feature Design
-
-Indicators should not be used identically across all timeframes.
-
-- **1d**
-  Macro trend, long directional bias, structural bull/bear/range regime.
-- **4h**
-  Intermediate regime, pullback quality, trend continuation vs exhaustion.
-- **1h**
-  Trade setup formation, confirmation, momentum alignment, stop placement logic.
-- **15m**
-  Fine entry timing, trigger candle, micro-structure, and exit refinement.
+Trading metrics are then evaluated only inside the requested monthly evaluation window.
 
-### 5.4 Derived Composite Features
+## 4. Indicator and Feature Layer
 
-Beyond raw indicators, the Feature Engineering Agent should create composite signals such as:
+Indicators are calculated per timeframe using strategy parameters where available.
 
-- higher-timeframe trend alignment score,
-- lower-timeframe trigger quality score,
-- trend-versus-mean-reversion regime classifier,
-- volatility-adjusted RSI state,
-- MACD momentum acceleration score,
-- volume-confirmed breakout score,
-- news-sensitive risk regime score,
-- entry timing confidence score.
+### 4.1 Core indicators
 
-These derived features are especially valuable for monthly self-improvement because they are easier to compare, rank, and refine than raw indicators alone.
+The current feature layer includes:
 
----
+- EMA short and EMA long
+- MACD, MACD signal, MACD histogram
+- RSI and fast RSI
+- SMA `10`, `20`, `50`, `200`
+- parameterized SMA short and SMA long
+- Bollinger mid, upper, lower, width
+- Ichimoku tenkan, kijun, span A, span B, lagging span, cloud bias
+- VWAP and rolling VWAP
+- volume profile approximations: POC, VAL, VAH
+- ATR and ATR percentage
+- volume surge ratio
+- body-to-range ratio
+- trend slope features
+- trend alignment score
 
-## 6. Historical News Intelligence Layer
+### 4.2 Feature intent by timeframe
 
-### 6.1 News Scope
+The implemented logic uses the stack as follows:
 
-The system must download or otherwise ingest historical news related to:
+- `1d`: slow bull or bear classification.
+- `4h`: directional confirmation and regime reinforcement.
+- `1h`: setup confirmation, especially breakout or breakdown context.
+- `15m`: discrete trigger event and tactical execution timing.
 
-- BTC / Bitcoin,
-- cryptocurrency markets,
-- Web3,
-- macro news with strong BTC relevance,
-- exchange, ETF, regulation, mining, stablecoin, and risk-event topics.
+## 5. News Intelligence Layer
 
-Target date range:
+### 5.1 Enrichment
 
-- **`2023-01-01` to `2025-12-31`**
+Historical news is enriched with:
 
-### 6.2 News Data Expectations
+- heuristic sentiment score
+- bullish, bearish, or neutral polarity
+- sentiment strength
+- event type inference such as `etf`, `regulation`, `macro`, `hack`, `liquidation`, `mining`, `stablecoin`
+- impact lag bucket
+- impact duration bucket
+- impacted timeframe hint
+- publication timestamp confidence
 
-Each news item should ideally include:
+### 5.2 Confidence-aware impact
 
-- publication timestamp,
-- headline,
-- full text or summary,
-- source,
-- URL or reference,
-- category or topic tags,
-- entities mentioned,
-- region if relevant,
-- confidence in parsing quality.
+If publication time quality is weak, the system reduces the effect of that news item. If publication time is missing, the record is still handled deterministically but marked low confidence.
 
-### 6.3 News Analysis Requirements
+### 5.3 News context used during trading
 
-The News Intelligence Agent should analyze:
+The runtime converts enriched news into per-bar context:
 
-- sentiment polarity: bullish / bearish / neutral,
-- sentiment strength,
-- event type: regulation, ETF, macro, hack, adoption, liquidity, etc.,
-- novelty versus repeated story,
-- credibility of source,
-- expected market relevance,
-- expected impact lag,
-- expected impact duration.
+- `impact`: signed directional influence
+- `active_count`: number of active events
+- `hard_cooldown`: blocks entry after major, high-confidence events
+- `soft_cooldown`: scales down new entries in medium-confidence event windows
 
-### 6.4 News-to-Price Impact Study
+This is intentionally asymmetric:
 
-This project specifically requires understanding **how** and **how long** news affects BTC price. The agent should therefore estimate:
+- favorable news can only boost size modestly,
+- adverse news can reduce size more strongly,
+- strong event windows can block fresh entries altogether.
 
-- whether the news effect appears immediately, within hours, or over multiple days,
-- whether the effect is strongest on `15m`, `1h`, `4h`, or `1d`,
-- whether the effect causes reversal, continuation, breakout, or volatility expansion,
-- whether the effect decays quickly or persists,
-- whether the effect depends on prior market regime.
+News does not create a trade by itself.
 
-### 6.5 Suggested Impact Windows
+## 6. Multi-Timeframe Regime Logic
 
-The system should evaluate each news item across multiple post-publication windows, such as:
+The live backtest path is `_run_multi_timeframe_backtest()` in `btc_self_improve_agent/tools.py`.
 
-- `0-1h`
-- `1-4h`
-- `4-12h`
-- `12-24h`
-- `1-3d`
-- `3-7d`
+### 6.1 Daily macro bias
 
-This makes the agent capable of learning statements like:
+The daily regime is built from a score that blends:
 
-- ETF approval headlines often create immediate momentum plus a secondary reaction window,
-- regulatory fear headlines can create fast downside shock but short-lived follow-through,
-- macro liquidity narratives may have slower but more persistent trend influence.
+- close versus `SMA_200`
+- close versus `SMA_long`
+- EMA short versus EMA long
+- MACD versus MACD signal
+- Ichimoku cloud bias
+- 20-bar trend slope
 
-### 6.6 Why This Layer Is Essential
+From that score the engine derives:
 
-Without this layer, the system would only be a technical-indicator trader. Your requirement is stronger: the agent must combine **historical data, news, indicators, pre-analysis, and learned lessons** into one evolving decision framework.
+- `macro_bull`
+- `macro_bear`
+- `trend_1d` in `{1, 0, -1}`
 
----
+The daily filter is intentionally slower than the earlier version so BTC is not classified bearish too easily during ordinary corrections.
 
-## 7. Context Engineering for a Long-Horizon Trading Agent
+### 6.2 4h confirmation
 
-### 7.1 Why Context Engineering Matters Here
+The `4h` confirmation score blends:
 
-This project spans three full years of market data and news. No LLM can reason safely by loading all raw candles and all raw articles into a single prompt. The system therefore needs strong context engineering.
+- close versus EMA short
+- close versus SMA long
+- close versus rolling VWAP
+- MACD versus MACD signal
+- Ichimoku cloud bias
 
-### 7.2 Required Context Layers
+This becomes:
 
-- **Instructions**
-  System rules, risk rules, allowed actions, reporting format.
-- **Knowledge**
-  Preprocessed market features, indicator tables, news summaries, impact-study outputs.
-- **Working Memory**
-  Current month state, current open trade state, regime summary, relevant recent news clusters.
-- **Long-Term Memory**
-  Monthly lessons, strategy revisions, known failure modes, high-performing setups, conditions to avoid.
-- **Tool Outputs**
-  Feature queries, sentiment results, paper-trade logs, scorecards, and backtest metrics.
+- `trend_4h_bull_score`
+- `trend_4h_bear_score`
+- `trend_4h` in `{1, 0, -1}`
 
-### 7.3 Compression Strategy
+### 6.3 Higher-timeframe alignment
 
-The system should never feed raw historical bulk data directly to the LLM unless necessary. Instead it should compress:
+The engine computes:
 
-- raw candles -> indicator tables and regime summaries,
-- raw news -> event clusters and sentiment timelines,
-- trade logs -> monthly performance summaries,
-- lessons learned -> concise strategy revision memory.
+- `higher_aligned`: `1d` and `4h` point the same way
+- `higher_long_score`
+- `higher_short_score`
 
-This is what enables recurring self-improvement without context explosion.
+The active regimes are then:
 
----
+- `bull_regime = macro_bull and 4h bull confirmation`
+- `bear_regime = macro_bear and 4h bear confirmation`
+- otherwise `range`
 
-## 8. Paper Trading Framework
+## 7. Entry Logic
 
-### 8.1 Required Trading Logic
+### 7.1 Current live setup families
 
-The paper-trading agent must operate exactly as requested:
+The current production entry path is intentionally narrow.
 
-- use **`4h` and `1d`** to identify overall market trend, BTC context, and macro situation,
-- use **`15m` and `1h`** to determine entries and exits.
+Active setup families:
 
-### 8.2 Decision Flow per Trade
+- `long_breakout`
+- `short_breakdown`
 
-For every potential trade, the agent should follow this sequence:
+Inactive in the live entry path right now:
 
-1. determine the `1d` market regime,
-2. confirm or reject directional bias using `4h`,
-3. inspect recent relevant news and active impact windows,
-4. evaluate whether conditions favor trend-following, breakout, pullback, or mean-reversion,
-5. seek entry confirmation on `1h`,
-6. fine-tune trigger on `15m`,
-7. define stop, take-profit, invalidation, and trade duration expectation,
-8. simulate execution with realistic timing constraints,
-9. manage trade exits using lower-timeframe conditions while respecting higher-timeframe invalidation.
+- long pullback
+- long trend continuation
+- short rally fade
+- short trend continuation
 
-### 8.3 Required Paper Trading Inputs
+Some related parameters are still present in the strategy schema for compatibility, but they are not used by the current signal engine.
 
-Each historical trade decision should be based on:
+### 7.2 Long-side philosophy
 
-- market data,
-- historical news available before the decision timestamp,
-- pre-calculated indicators,
-- pre-analyzed news sentiment,
-- pre-analyzed market regime outputs,
-- strategy memory from prior months only.
+Longs are allowed only when all of these are true:
 
-This avoids forward-looking leakage and preserves realistic historical simulation.
+- `bull_regime` is active
+- `1d` and `4h` are aligned
+- higher-timeframe long score clears the minimum quality threshold
 
-### 8.4 Trade Types
+This encodes the intended BTC long bias.
 
-The strategy framework may support:
+### 7.3 Short-side philosophy
 
-- long trend continuation,
-- long pullback in uptrend,
-- short trend continuation in downtrend,
-- short rally fade in downtrend,
-- volatility breakout,
-- no-trade state when signals conflict.
+Shorts are allowed only when all of these are true:
 
-No-trade discipline should be treated as a valid decision, not a failure.
+- `bear_regime` is active
+- `1d` and `4h` are aligned
+- daily bear score is very strong
 
----
+Shorts are deliberately more restrictive than longs.
 
-## 9. Monthly Self-Learning and Self-Improvement Loop
+### 7.4 1h setup confirmation
 
-### 9.1 Monthly Walk-Forward Design
+A long breakout needs `1h` confirmation such as:
 
-The most important upgrade in this document is the **monthly recurring self-improvement loop**.
+- close at or above the rolling `1h` breakout high
+- `1h` volume surge
+- `1h` MACD confirmation
+- `1h` price above rolling VWAP
 
-The system should process history month by month:
+A short breakdown mirrors that logic on the downside and also requires the `1h` close to stay below `SMA_200`.
 
-1. start with an initial strategy hypothesis,
-2. paper trade one month of historical data,
-3. measure performance and diagnose errors,
-4. extract lessons,
-5. update the strategy,
-6. carry the updated strategy into the next month,
-7. continue until the end of `2025-12`.
+### 7.5 15m trigger
 
-This creates a realistic walk-forward learning framework rather than a one-time optimization.
+A long trigger then requires a discrete `15m` event:
 
-### 9.2 What the Agent Should Learn Each Month
+- prior `15m` close below the rolling `15m` breakout high
+- current `15m` close at or above that breakout high
+- `15m` volume surge
+- `15m` MACD confirmation
+- improving `15m` MACD histogram
+- `15m` price above rolling VWAP
 
-The Reflection and Learning Agent should summarize:
+A short trigger mirrors that structure on the downside.
 
-- which setups worked,
-- which setups failed,
-- in which market regimes the strategy had edge,
-- how news changed signal quality,
-- whether entries were too early or too late,
-- whether exits captured enough of the move,
-- whether risk was too aggressive or too conservative,
-- whether certain indicators added value or noise,
-- whether impact duration estimates were accurate.
+### 7.6 Discrete entries, not continuous activation
 
-### 9.3 Monthly Improvement Actions
+The tuned implementation only fires on transition bars. It does not keep generating fresh entries on every bar that happens to remain above a threshold.
 
-After extracting lessons, the system should update one or more of:
+That change was important because the older score-combination approach overtraded badly.
 
-- indicator thresholds,
-- regime filters,
-- news sentiment weighting,
-- cooldown periods after major news,
-- stop-loss and take-profit logic,
-- position sizing rules,
-- confirmation requirements across timeframes,
-- trade avoidance rules in low-quality conditions,
-- ranking weights for setup selection.
+### 7.7 Entry workflow field
 
-### 9.4 Guardrails Against Overfitting
+When a trade candidate survives the full stack, the runtime records:
 
-Self-improvement must not become blind curve-fitting. The monthly learning loop should therefore favor:
+- `entry_signal_tf = 1h+15m`
+- `setup_family = long_breakout` or `short_breakdown`
 
-- small and explainable rule changes,
-- limited parameter drift,
-- documented rationale for every revision,
-- validation across multiple prior months or regimes where possible,
-- explicit rejection of improvements that help one month but damage robustness.
+This is what the reports now display.
 
-The goal is not to memorize history but to discover durable behavior.
+## 8. Position Sizing and Risk Management
 
----
+The execution simulator runs on the `15m` base frame.
 
-## 10. Strategy Formation and Final Strategy Markdown
+### 8.1 Sizing
 
-### 10.1 Purpose
+Position size is capped by:
 
-After the month-by-month learning loop completes, the agent should consolidate its best and most robust logic into a **final trading strategy document** in markdown.
+- `max_position`
+- raw signal magnitude
+- a risk cap based on `max_loss_per_trade / ATR_distance`
 
-### 10.2 What the Final Strategy Document Should Contain
+This keeps trades from growing too large in high-volatility conditions.
 
-The final strategy markdown should include:
+### 8.2 Stops and targets
 
-- strategy name,
-- strategy objective,
-- traded market and timeframe stack,
-- market regime definitions,
-- news-handling policy,
-- required indicator set,
-- long-entry rules,
-- short-entry rules,
-- no-trade rules,
-- stop-loss rules,
-- take-profit rules,
-- position sizing rules,
-- trade management rules,
-- invalidation conditions,
-- monthly review process,
-- known weaknesses,
-- best-performing environments,
-- worst-performing environments.
+The simulator uses:
 
-### 10.3 Why a Written Strategy Matters
+- ATR-based initial stop logic
+- ATR-based target logic
+- breakeven arming at `breakeven_r_multiple`
+- trailing stop updates as price moves
+- setup-aware target and hold adjustments
 
-If the final strategy cannot be clearly written, it is not mature enough. A written strategy is the bridge between experimental agent behavior and auditable trading logic.
+Because only `long_breakout` and `short_breakdown` are currently active, the setup-specific behavior that matters most is:
 
----
+- `long_breakout`: longer hold allowance and slightly larger target multiple
+- `short_breakdown`: slightly reduced target multiple and shorter hold than the long breakout case
 
-## 11. Final Backtest Requirement
+### 8.3 Exit reasons
 
-### 11.1 Backtest Objective
+The runtime records explicit exit events:
 
-Once the final strategy is drafted, the agent should run a full historical backtest across the prepared dataset using:
+- `stop_loss_hit`
+- `take_profit_hit`
+- `higher_timeframe_invalidation`
+- `signal_flip`
+- `max_holding_reached`
 
-- historical trading data,
-- historical news,
-- pre-calculated indicators,
-- pre-analyzed sentiment outputs,
-- pre-analyzed impact-duration results,
-- the final frozen strategy rules.
+These reasons feed directly into trade logs and backtest reports.
 
-### 11.2 Backtest Principles
+### 8.4 Cooldowns
 
-The final backtest should:
+There are two cooldown mechanisms:
 
-- use only time-appropriate information,
-- avoid data leakage,
-- respect the timeframe hierarchy,
-- include realistic trading assumptions,
-- keep the final strategy fixed during the final evaluation run.
+- `cooldown_bars_after_news`: event-driven hard or soft entry suppression
+- `trade_cooldown_bars`: pause after exits before a new position may open
 
-### 11.3 Required Backtest Metrics
+## 9. Monthly Self-Improvement Loop
 
-The final report should be as detailed as possible and include at minimum:
+The orchestrator in `agent.py` runs month by month across the configured history.
 
-- total return,
-- annualized return,
-- Sharpe ratio,
-- Sortino ratio,
-- maximum drawdown,
-- Calmar ratio,
-- profit factor,
-- win rate,
-- average win,
-- average loss,
-- expectancy,
-- average holding time,
-- number of trades,
-- monthly performance breakdown,
-- regime-wise performance,
-- long vs short performance,
-- news-event trade performance,
-- best trades,
-- worst trades,
-- streak analysis,
-- risk-adjusted observations,
-- failure modes and caveats.
+### 9.1 Monthly sequence
 
-### 11.4 Required Backtest Narrative
+For each month the agent:
 
-The report should not only show metrics. It should explain:
+1. slices warmup data and month data,
+2. filters news with a short pre-month lookback,
+3. runs the backtest only on information available at that time,
+4. scores the month,
+5. reflects on failures and successes,
+6. updates the strategy only if enough evidence exists,
+7. stores reports, trace data, and memory.
 
-- why the strategy worked when it worked,
-- where the edge came from,
-- how the higher-timeframe filters improved lower-timeframe entries,
-- how news intelligence changed outcomes,
-- how the monthly self-improvement loop changed the final system,
-- where the strategy remains fragile.
+### 9.2 Update gating
 
----
+The system no longer updates parameters after any weak single month.
 
-## 12. Detailed End-to-End Workflow
+A monthly parameter update requires aggregated evidence across the current month plus the previous two months:
 
-This is the full operating sequence the upgraded agent should follow.
+- at least `2` active months,
+- at least `12` trades in aggregate.
 
-### Phase 1: Data Acquisition
+If evidence is too thin, the strategy is held steady and the skip reason is stored.
 
-1. Download Binance BTCUSDT OHLCV data for `15m`, `1h`, `4h`, and `1d` from `2023-01-01` to `2025-12-31`.
-2. Validate completeness, continuity, and timestamps.
-3. Download or ingest historical BTC, crypto, and Web3 news for the same date range.
-4. Normalize news timestamps, topics, source quality, and entity tags.
+### 9.3 Reflection overrides
 
-### Phase 2: Preprocessing and Feature Engineering
+`reflection.py` now uses deterministic guardrails when LLM feedback would be too noisy:
 
-1. Pre-calculate all required indicators for each timeframe.
-2. Build regime and structural features.
-3. Cluster related news and score sentiment.
-4. Estimate lag and duration of price impact per news item or event cluster.
-5. Create compressed monthly context summaries for agent use.
+- `0` trades: relax only trigger quality modestly, keep macro filter intact, keep shorts restrictive
+- `< 5` trades: avoid major changes, prefer stability over optimization
+- losing month with weak trade quality: reduce countertrend shorts, prefer breakout or continuation over shallow pullbacks, reduce news amplification
 
-### Phase 3: Monthly Paper Trading
+### 9.4 Rule-based parameter drift control
 
-1. Initialize starting strategy.
-2. For each month from `2023-01` through `2025-12`:
-   - read only data available up to that month,
-   - identify `1d` and `4h` market context,
-   - use `1h` and `15m` for entries and exits,
-   - integrate relevant active news effects,
-   - paper trade the month,
-   - produce trade logs and monthly report.
+`planner.py` now nudges parameters in safer directions:
 
-### Phase 4: Monthly Reflection and Improvement
+- weak performance reduces `news_weight`
+- weak performance raises `short_score_threshold`
+- weak performance can extend `trade_cooldown_bars`
+- low-trade months can relax breakout filters only modestly
+- the update logic avoids the earlier drift toward globally compressed RSI thresholds and excessive news amplification
 
-1. Evaluate monthly results.
-2. Summarize lessons, edge sources, and recurring mistakes.
-3. Update strategy rules conservatively.
-4. Save updated strategy memory.
-5. Roll forward to the next month.
+## 10. Reporting and Metrics
 
-### Phase 5: Final Strategy Consolidation
+The backtest output now includes trade-level and portfolio-level metrics such as:
 
-1. Compare all monthly revisions.
-2. Keep robust rules and discard unstable ones.
-3. Draft the final strategy markdown.
+- total return
+- annualized return
+- Sharpe ratio
+- Sortino ratio
+- maximum drawdown
+- Calmar ratio
+- trade-level win rate
+- profit factor
+- expectancy
+- average win
+- average loss
+- average holding bars
+- trade count
+- monthly breakdown
+- regime breakdown
+- narrative summary
 
-### Phase 6: Final Frozen Backtest
+### 10.1 Reliability flags
 
-1. Lock the final strategy.
-2. Run the full historical backtest.
-3. Generate a detailed backtest report.
+The engine also attaches caution flags such as:
 
----
+- `low_sample_size`
+- `one_sided_exposure`
+- `extreme_win_rate_small_sample`
+- `profit_factor_unstable`
+- `negative_sharpe`
+- `profit_factor_below_one`
+- `negative_total_return`
 
-## 13. Recommended Evaluation Dimensions
+These flags are written into monthly and final reports so poor-looking metrics are not overinterpreted.
 
-The agent should score itself across multiple dimensions, not only profitability.
+### 10.2 Trade rationale text
 
-- **Return Quality**
-  Net return, risk-adjusted return, consistency.
-- **Risk Quality**
-  drawdown control, tail-loss behavior, regime resilience.
-- **Execution Quality**
-  entry efficiency, exit efficiency, premature exit rate, late entry rate.
-- **Signal Quality**
-  alignment between higher and lower timeframes, false-positive rate, no-trade discipline.
-- **News Intelligence Quality**
-  sentiment accuracy, impact-window calibration, event relevance filtering.
-- **Learning Quality**
-  whether monthly changes improved robustness rather than just local fit.
-- **Explainability**
-  whether the system can clearly explain why each trade was taken or avoided.
+Trade logs now explain entries and exits in a way that matches the current engine:
 
-These evaluation dimensions are essential for meaningful self-improvement.
+- higher-timeframe rationale references `1d` macro bias and `4h` confirmation
+- lower-timeframe rationale references the `1h + 15m` workflow and setup family
+- news rationale references active event count, directional impact, and cooldown state
 
----
+## 11. Current Default Strategy Profile
 
-## 14. Trustworthiness, Safety, and Research Integrity
+The current default strategy in `planner.py` is tuned around a sparse breakout-led BTC workflow.
 
-Even though this is a historical paper-trading system, it still needs strong guardrails.
+Key defaults:
 
-- **No data leakage**
-  The agent must not access future candles, future news, or future monthly lessons.
-- **Reproducibility**
-  Every run should be traceable to the same data snapshot and rule version.
-- **Explainability**
-  Each strategy revision should have a written rationale.
-- **Human auditability**
-  A human reviewer should be able to inspect why the agent changed its rules.
-- **Separation of roles**
-  Data ingestion, feature computation, trading, and reflection should be separated to reduce hidden errors.
+- `entry_timeframe: auto`
+- `max_position: 0.55`
+- `stop_atr_multiple: 2.6`
+- `take_profit_atr_multiple: 5.0`
+- `trend_filter_strength: 0.62`
+- `long_score_threshold: 0.82`
+- `short_score_threshold: 0.95`
+- `score_hysteresis: 0.08`
+- `breakout_volume_surge: 1.20`
+- `short_breakdown_volume_surge: 1.60`
+- `trade_cooldown_bars: 32`
+- `breakout_1h_window: 72`
+- `breakout_15m_window: 32`
+- `news_weight: 0.12`
+- `news_impact_cap: 0.6`
 
-This is the quant-trading version of trustworthy AI-agent design.
+This profile is intentionally conservative and much less reactive than the earlier version.
 
----
+## 12. What Changed in This Tuning Pass
 
-## 15. Deliverables Required from the Upgraded Agent System
+This revision addressed the main issues observed in prior review and backtest output:
 
-To fully satisfy the project requirements, the completed system should ultimately produce the following artifacts:
+- enforced the intended `1d -> 4h -> 1h -> 15m` hierarchy
+- removed the old effective "pick one entry timeframe" behavior
+- made BTC structurally long-biased and kept shorts highly selective
+- shifted the live signal engine to discrete breakout and breakdown events
+- reduced news from alpha amplifier to risk modifier
+- slowed monthly updates so thin evidence does not drift parameters aggressively
+- improved reporting so rationales, reliability flags, and trade-level metrics match runtime behavior
 
-1. **Historical BTC market dataset** covering `2023-01-01` to `2025-12-31` for `15m`, `1h`, `4h`, and `1d`.
-2. **Pre-calculated indicator dataset** for all required timeframes.
-3. **Historical crypto/Web3/BTC news dataset** for the same period.
-4. **News sentiment and impact analysis outputs** including estimated effect timing and duration.
-5. **Monthly paper-trading logs** with timestamped rationale.
-6. **Monthly performance reports** with lessons learned.
-7. **Monthly strategy revision history** showing how the agent self-improved over time.
-8. **Final strategy markdown** describing the learned trading strategy.
-9. **Final backtest report** with detailed metrics, narrative analysis, strengths, weaknesses, and risk caveats.
+## 13. Known Limitations
 
----
+The current implementation is materially cleaner than the earlier local baseline, but it is not finished research.
 
-## 16. Exact Mapping to the 9 Required Capabilities
+Important limitations:
 
-### Requirement 1
+- the live entry engine currently activates only breakout-led setups
+- some legacy strategy fields remain in the schema for compatibility even though the live signal path does not use them yet
+- the strategy still needs more research before it can be considered robust across all BTC environments
+- validation in this repository is currently stronger through direct simulation and report inspection than through a fully configured test suite
 
-The agent is designed to **recurringly self-learn and self-improve** using historical market data, historical news, monthly reflection, and long-term strategy memory.
+## 14. Summary
 
-### Requirement 2
+The repository now implements a narrower, more disciplined BTC trading agent than the earlier design document described.
 
-The Market Data Agent explicitly downloads **Binance free API** BTC historical price and volume data from `2023-01-01` to `2025-12-31` for `15m`, `1h`, `4h`, and `1d`.
+In practice, the current system is:
 
-### Requirement 3
+- a multi-timeframe BTC backtester with `1d` macro bias and `4h` confirmation,
+- a breakout-led execution model using `1h` setup confirmation and `15m` trigger timing,
+- a confidence-aware news risk filter,
+- a monthly walk-forward learner with evidence gating,
+- and a reporting pipeline that records not just returns, but why the system behaved as it did.
 
-The Feature Engineering Agent pre-calculates the required indicators including **MA/EMA/SMA, MACD, RSI, Bollinger Bands, Ichimoku Cloud, VWAP, Volume Profile**, and related derived features.
-
-### Requirement 4
-
-The News Intelligence Agent downloads historical BTC/crypto/Web3 news for `2023-01-01` to `2025-12-31`, analyzes sentiment, and estimates **how** and **how long** the news affects BTC price.
-
-### Requirement 5
-
-The Paper Trading Agent uses historical prices, historical news, indicators, and analysis outputs to perform **historical paper trading** and generate detailed trading reports.
-
-### Requirement 6
-
-The trading logic explicitly uses **`4h` and `1d`** for market trend and situation analysis, and **`15m` and `1h`** for entries and exits.
-
-### Requirement 7
-
-The monthly walk-forward loop ensures the agent keeps trading historical data month by month, summarizes performance, learns lessons, self-improves, and applies the updated strategy to the next month.
-
-### Requirement 8
-
-After the learning cycle completes, the Strategy Authoring Agent drafts the **final trading strategy as a markdown file**.
-
-### Requirement 9
-
-The final frozen strategy is then used for a full **backtest** on historical trading data, historical news, preprocessed indicators, and pre-analysis outputs, and the result is written as a detailed backtest report.
-
----
-
-## 17. Final Conclusion
-
-The upgraded design is no longer just “an AI agent with indicators.” It is a **self-improving quant research agent system** built around a disciplined learning loop:
-
-**historical data + historical news + multi-timeframe indicators + paper trading + monthly reflection + strategy updates + final strategy drafting + frozen backtest**
-
-That closed loop is the key architectural upgrade. It transforms the system from static rule testing into a recurring learning framework capable of producing a refined BTC trading strategy and a detailed evidence trail for how that strategy was formed.
+That is the latest code-aligned strategy design for this project.
